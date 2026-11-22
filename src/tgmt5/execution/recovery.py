@@ -49,7 +49,8 @@ def recover(eng: "ExecutionEngine") -> RecoveryReport:
                 ExecutionRow.is_simulated == eng.simulated,
                 ExecutionRow.state.in_([LegState.SUBMITTING.value, LegState.UNCERTAIN.value]))):
             if eng._reconcile_leg(s, leg):
-                rep.resolved_uncertain.append(leg.client_tag)
+                if leg.state != LegState.UNCERTAIN.value:
+                    rep.resolved_uncertain.append(leg.client_tag)
             else:
                 leg.state = LegState.FAILED.value
                 leg.broker_comment = (leg.broker_comment + " | not found at broker on recovery").strip(" |")
@@ -78,12 +79,23 @@ def recover(eng: "ExecutionEngine") -> RecoveryReport:
             states = {LegState(l.state) for l in legs}
             if sig.status in (SignalStatus.SUBMITTING.value, SignalStatus.UNCERTAIN.value,
                               SignalStatus.QUEUED.value):
+                if LegState.UNCERTAIN in states:
+                    if sig.status != SignalStatus.UNCERTAIN.value:
+                        eng._transition(s, sig, SignalStatus.UNCERTAIN,
+                                        "reconciliation incomplete - still awaiting broker state")
+                    continue
                 live = [l for l in legs if l.state in (LegState.OPEN.value, LegState.PENDING.value,
                                                        LegState.CLOSED.value)]
-                status = (SignalStatus.FAILED if not live else
-                          SignalStatus.EXECUTED if len(live) == len(legs) else SignalStatus.PARTIAL)
-                if eng.simulated and live:
+                if not live:
+                    status = SignalStatus.FAILED
+                elif eng.simulated:
                     status = SignalStatus.SIMULATED
+                elif len(live) == len(legs):
+                    status = (SignalStatus.PENDING_PLACED
+                              if all(l.state == LegState.PENDING.value for l in legs)
+                              else SignalStatus.EXECUTED)
+                else:
+                    status = SignalStatus.PARTIAL
                 eng._transition(s, sig, status, "status restored by recovery")
             _maybe_close_signal(eng, s, sig, legs)
         # 4. waiting signals past expiry

@@ -288,13 +288,11 @@ class ExecutionEngine:
     def _edit_of_active_signal(self, sig: SignalRow, msg: TelegramMessage) -> int:
         result = self._parser_for(msg.source_id).parse(msg.text)
         new = result.signal
-        if (self.cfg.execution.apply_edits_to_open_trades and new is not None
-                and new.symbol == sig.symbol and new.direction.value == sig.direction):
-            instr: list[ManagementInstruction] = []
-            if new.stop_loss != sig.stop_loss:
-                instr.append(ManagementInstruction(ManagementType.MODIFY_SL, price=new.stop_loss))
-            for ins in instr:
-                self._apply_management(sig.id, ins, origin=f"edit of message {msg.message_id}")
+        if (self.cfg.execution.apply_edits_to_open_trades and self.mode is not ExecutionMode.MONITOR
+                and new is not None and new.symbol == sig.symbol
+                and new.direction.value == sig.direction and new.stop_loss != sig.stop_loss):
+            self._apply_management(sig.id, ManagementInstruction(ManagementType.MODIFY_SL, price=new.stop_loss),
+                                   origin=f"edit of message {msg.message_id}")
             return sig.id
         with self.db.session() as s:
             s.add(SignalEventRow(signal_id=sig.id, status_from=sig.status, status_to=sig.status,
@@ -617,10 +615,20 @@ class ExecutionEngine:
             s.flush()
             leg_ids = [r.id for r in rows]
         # rows are committed (SUBMITTING) before anything is sent
-        for leg_id in leg_ids:
+        for idx, leg_id in enumerate(leg_ids):
+            if self.risk.state.emergency_stop:
+                with self.db.session() as s:
+                    for rem_id in leg_ids[idx:]:
+                        rem = s.get(ExecutionRow, rem_id)
+                        if rem is not None and rem.state == LegState.SUBMITTING.value:
+                            rem.state = LegState.REJECTED.value
+                            rem.broker_comment = "aborted: emergency stop active"
+                break
             self._send_leg(leg_id, plan)
-        self.risk.record_trade()
-        return self._finalize_signal(sig_id, plan.pending)
+        status = self._finalize_signal(sig_id, plan.pending)
+        if not self.simulated and status is not SignalStatus.FAILED:
+            self.risk.record_trade()
+        return status
 
     def _build_request(self, leg: ExecutionRow, plan: ExecutionPlan, price: float,
                        filling: int) -> TradeRequest:
@@ -834,6 +842,12 @@ class ExecutionEngine:
                 continue
             side = 0 if o.type in (OrderType.BUY_LIMIT, OrderType.BUY_STOP) else 1
             pr = self.gw.calc_profit(side, o.symbol, o.volume_current, o.price_open, o.sl)
+            if pr is None:
+                spec = self.gw.symbol_spec(o.symbol)
+                if spec is not None and spec.trade_tick_size:
+                    sign = 1 if side == 0 else -1
+                    pr = sign * (o.sl - o.price_open) / spec.trade_tick_size * \
+                        (spec.trade_tick_value_loss or spec.trade_tick_value) * o.volume_current
             out.append(OpenRisk(self.resolver.canonical_of(o.symbol), max(0.0, -(pr or 0)),
                                 o.volume_current))
         return out

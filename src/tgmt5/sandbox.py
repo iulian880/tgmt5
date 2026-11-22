@@ -22,6 +22,12 @@ def make_sandbox_broker() -> FakeMT5Gateway:
                        company="Sandbox (simulated)")
     b.add_symbol(fx_spec("EURUSD"), 1.08500, 1.08508)
     b.add_symbol(fx_spec("GBPUSD"), 1.27000, 1.27010)
+    b.add_symbol(fx_spec("AUDUSD"), 0.65400, 0.65409)
+    b.add_symbol(fx_spec("NZDUSD"), 0.59200, 0.59210)
+    b.add_symbol(fx_spec("USDCHF", profit_ccy="CHF"), 0.88100, 0.88109)
+    b.add_symbol(fx_spec("USDCAD", profit_ccy="CAD"), 1.39400, 1.39410)
+    b.add_symbol(fx_spec("GBPCAD", profit_ccy="CAD"), 1.77000, 1.77014)
+    b.add_symbol(fx_spec("GBPNZD", profit_ccy="NZD"), 2.14500, 2.14518)
     b.add_symbol(fx_spec("USDJPY", digits=3, profit_ccy="JPY"), 150.000, 150.010)
     b.add_symbol(gold_spec(), 2660.00, 2660.15)
     return b

@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from tgmt5.config import AppConfig
+from tgmt5.domain.models import ExecutionMode
 from tgmt5.persistence.models import AppEventRow, Base, Setting
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,8 @@ class Database:
         if raw is None:
             return AppConfig()
         cfg = AppConfig.model_validate(raw)
+        # Safety invariant: always start in MONITOR mode even if the DB row was altered.
+        cfg.mode = ExecutionMode.MONITOR
         return cfg
 
     def save_config(self, cfg: AppConfig) -> None:
@@ -120,9 +123,10 @@ class Database:
     # ------------------------------------------------------------- events
     def log_event(self, level: str, category: str, message: str, data: dict | None = None) -> None:
         with self.session() as s:
-            from tgmt5.logging_setup import redact
-            s.add(AppEventRow(level=level, category=category, message=redact(message)[:4000], data=data,
-                              ts=datetime.now(timezone.utc)))
+            from tgmt5.logging_setup import redact, redact_data
+            safe_data = redact_data(data) if data is not None else None
+            s.add(AppEventRow(level=level, category=category, message=redact(message)[:4000],
+                              data=safe_data, ts=datetime.now(timezone.utc)))
 
     def recent_events(self, limit: int = 500, level: str | None = None,
                       search: str | None = None) -> list[AppEventRow]:

@@ -4,9 +4,18 @@ from __future__ import annotations
 import re
 
 from tgmt5.mt5.interface import MT5Gateway
-from tgmt5.parsing.symbols import broker_candidates, canonicalize
+from tgmt5.parsing.symbols import CURRENCIES, broker_candidates, canonicalize
 
 _SUFFIX_RE = re.compile(r"^[._\-+#]?[A-Za-z0-9]{0,4}$")
+
+
+def _is_valid_suffix(suffix: str) -> bool:
+    if not suffix or not _SUFFIX_RE.match(suffix):
+        return False
+    # Never treat a trailing currency code without a separator (e.g. GOLD + EUR = GOLDEUR) as a broker suffix.
+    if suffix.upper() in CURRENCIES:
+        return False
+    return True
 
 
 class SymbolResolver:
@@ -32,16 +41,25 @@ class SymbolResolver:
         if canonical in self._cache:
             return self._cache[canonical]
         names = set(self.universe)
+        names_ci = {n.upper(): n for n in self.universe}
         result: str | None = None
         for cand in broker_candidates(canonical):
-            if self.suffix and cand + self.suffix in names:
-                result = cand + self.suffix
-                break
+            if self.suffix:
+                want = cand + self.suffix
+                if want in names:
+                    result = want
+                    break
+                if want.upper() in names_ci:
+                    result = names_ci[want.upper()]
+                    break
             if cand in names:
                 result = cand
                 break
+            if cand.upper() in names_ci:
+                result = names_ci[cand.upper()]
+                break
             suffixed = [n for n in names if n.upper().startswith(cand.upper())
-                        and _SUFFIX_RE.match(n[len(cand):]) and n[len(cand):]]
+                        and _is_valid_suffix(n[len(cand):])]
             if len(suffixed) == 1:
                 result = suffixed[0]
                 break

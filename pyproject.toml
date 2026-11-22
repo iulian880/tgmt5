@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgmt5"
-version = "0.4.0"
+version = "0.5.0"
 description = "Telegram -> MetaTrader 5 risk-controlled copy trading desktop application (DEMO by default, opt-in REAL ACCOUNT mode)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -36,6 +36,7 @@ tgmt5 = ["persistence/migrations/*.py", "persistence/migrations/versions/*.py", 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "demo_e2e: real IC Markets DEMO end-to-end tests (Windows + MT5 terminal + explicit opt-in required)",
 ]

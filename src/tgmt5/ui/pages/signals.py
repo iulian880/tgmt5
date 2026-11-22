@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QComboBox, QFrame, QGridLayout, QLineEdit, QPushButton, QWidget
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -41,7 +42,7 @@ class SignalCard(Card):
         msg = QFrame()
         msg.setObjectName("Message")
         txt = label(m.text[:600] + ("…" if len(m.text) > 600 else ""), "mono", wrap=True)
-        txt.setTextInteractionFlags(txt.textInteractionFlags())
+        txt.setTextInteractionFlags(Qt.TextSelectableByMouse)
         msg.setLayout(vbox(txt, margins=(12, 10, 12, 10)))
 
         info = QGridLayout()

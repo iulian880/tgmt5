@@ -192,7 +192,7 @@ class RiskPage(Page):
         self.slider.setRange(1, 200)                       # 0.05% .. 10% in 0.05 steps
         self.pct = dspin(0.05, 10, 0.05, suffix=" %")
         self.slider.valueChanged.connect(lambda v: self.pct.setValue(v * 0.05))
-        self.pct.valueChanged.connect(lambda v: self.slider.setValue(round(v / 0.05)))
+        self.pct.valueChanged.connect(self._sync_slider)
         self.bal_lot = dspin(0.01, 100, 0.01)
         self.bal_step = dspin(1, 1e7, 50)
         self.size_stack = QStackedWidget()
@@ -384,8 +384,8 @@ class RiskPage(Page):
         self.reset_br = QPushButton("Reset loss breaker")
         self.clear_em = QPushButton("Clear emergency stop")
         self.reset_dd.clicked.connect(self._reset_dd)
-        self.reset_br.clicked.connect(lambda: (self.svc.risk.reset_breaker(),
-                                               Toast.show_message("Breaker reset", "info")))
+        self.reset_br.clicked.connect(lambda: run_async(self.svc.reset_breaker(),
+                                                        lambda _: Toast.show_message("Breaker reset", "info")))
         self.clear_em.clicked.connect(lambda: run_async(self.svc.clear_emergency(),
                                                         lambda _: Toast.show_message("Emergency cleared")))
         self.lock.add(layout=hbox(self.lock_pill, self.lock_text, "stretch"))
@@ -874,6 +874,11 @@ class RiskPage(Page):
             self._refresh_reviews()
         run_async(self.svc.save_config(cfg), ok)
 
+    def _sync_slider(self, value: float) -> None:
+        self.slider.blockSignals(True)
+        self.slider.setValue(round(value / 0.05))
+        self.slider.blockSignals(False)
+
     def _reset_dd(self) -> None:
         a = self.svc.engine.account
         if a is None:
@@ -882,7 +887,12 @@ class RiskPage(Page):
         if QMessageBox.question(self, "Reset drawdown lockout",
                                 f"Reset the drawdown lockout and set the equity peak to {a.equity:,.2f}?") \
                 == QMessageBox.Yes:
-            self.svc.risk.reset_drawdown_lockout(a.equity)
+            run_async(self.svc.reset_drawdown_lockout(),
+                      lambda eq: Toast.show_message(f"Drawdown lockout reset (peak {eq:,.2f})", "info"))
+
+    def on_event(self, kind: str, data: dict) -> None:
+        if kind == "config" and data.get("imported"):
+            self.load()
 
     def activated(self) -> None:
         self._request_preview()

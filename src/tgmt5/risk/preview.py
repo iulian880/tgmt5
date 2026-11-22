@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from tgmt5.config import AppConfig, TpStrategy
 from tgmt5.domain.models import Direction
 from tgmt5.mt5.interface import MT5Gateway, OrderType, SymbolSpec
-from tgmt5.mt5.sim import fx_spec
+from tgmt5.mt5.sim import fx_spec, gold_spec
 from tgmt5.mt5.symbols import SymbolResolver
 from tgmt5.risk.sizing import SizingError, loss_at_stop, plan_volumes, tp_layout
 
@@ -100,13 +100,22 @@ def _row(gw, resolver, cfg: AppConfig, ex: ExampleSignal, pv: SizingPreview, acc
         def loss_fn(v: float) -> float:
             return loss_at_stop(gw, spec, direction, v, entry, sl)[0]
     else:
-        spec = fx_spec(ex.symbol, digits=3 if "JPY" in ex.symbol else 5)
-        if ex.entry is not None and ex.stop_loss is not None:
-            row.sl_pips = round(abs(ex.entry - ex.stop_loss) / pip_size(spec), 1)
-        sl_pips = row.sl_pips
+        if ex.symbol == "XAUUSD":
+            spec = gold_spec()
+            if ex.entry is not None and ex.stop_loss is not None:
+                row.sl_pips = round(abs(ex.entry - ex.stop_loss) / 0.1, 1)
+            sl_pips = row.sl_pips
 
-        def loss_fn(v: float) -> float:
-            return v * sl_pips * APPROX_PIP_VALUE
+            def loss_fn(v: float) -> float:
+                return v * sl_pips * 10.0     # 100 oz * $0.10/pip = $10/pip per lot
+        else:
+            spec = fx_spec(ex.symbol, digits=3 if "JPY" in ex.symbol else 5)
+            if ex.entry is not None and ex.stop_loss is not None:
+                row.sl_pips = round(abs(ex.entry - ex.stop_loss) / pip_size(spec), 1)
+            sl_pips = row.sl_pips
+
+            def loss_fn(v: float) -> float:
+                return v * sl_pips * APPROX_PIP_VALUE
 
     prof = r.symbol_profiles.get(ex.symbol)
     mult = prof.risk_multiplier if prof else 1.0

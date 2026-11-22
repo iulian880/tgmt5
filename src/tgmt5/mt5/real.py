@@ -123,6 +123,8 @@ class RealMT5Gateway:
         if not self.mt5.initialize(**kwargs):
             raise self._err("MT5 initialize")
         self._connected = True
+        self._offset = 0.0
+        self._offset_at = 0.0
         self._calibrate()
         acct = self.account_info()
         if acct is None:
@@ -133,6 +135,8 @@ class RealMT5Gateway:
         if self._connected:
             self.mt5.shutdown()
         self._connected = False
+        self._offset = 0.0
+        self._offset_at = 0.0
 
     def is_connected(self) -> bool:
         if not self._connected:
@@ -227,7 +231,10 @@ class RealMT5Gateway:
                      time=self._utc(d.time)) for d in res]
 
     def send(self, request: TradeRequest) -> TradeResult:
-        r = self.mt5.order_send(request.as_dict())
+        payload = request.as_dict()
+        if payload.get("expiration"):
+            payload["expiration"] = int(payload["expiration"] + self._offset)
+        r = self.mt5.order_send(payload)
         if r is None:
             code, desc = self.mt5.last_error()
             # No result object: we cannot know whether the server received it -> uncertain.

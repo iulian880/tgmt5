@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QLabel, QLayout, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
-from tgmt5.ui.theme import palette
+from tgmt5.ui.theme import DARK, palette
 
 STATUS_COLORS = {
     "RECEIVED": "muted", "PARSED": "info", "VALIDATED": "info", "QUEUED": "info",
@@ -149,7 +149,7 @@ class NavButton(QPushButton):
         p.setPen(Qt.NoPen)
         p.setBrush(c)
         p.drawRoundedRect(r, bh / 2, bh / 2)
-        p.setPen(QColor("#0A0E16") if self._badge_tone in ("warn", "profit") else QColor("white"))
+        p.setPen(QColor(DARK.bg) if self._badge_tone in ("warn", "profit") else QColor("white"))
         p.drawText(r, Qt.AlignCenter, self._badge)
 
 

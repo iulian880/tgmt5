@@ -35,12 +35,28 @@ def redact(text: str) -> str:
     return text
 
 
+def redact_data(obj):
+    """Recursively redact secrets inside structured event payloads."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {k: redact_data(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_data(x) for x in obj]
+    return obj
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         record.msg = redact(msg)
         record.args = ()
         return True
+
+
+class RedactingFormatter(logging.Formatter):
+    def formatException(self, ei) -> str:
+        return redact(super().formatException(ei))
 
 
 class JsonFormatter(logging.Formatter):
@@ -64,7 +80,7 @@ def setup_logging(log_dir: Path, level: int = logging.INFO) -> None:
     fh.setFormatter(JsonFormatter())
     fh.addFilter(RedactingFilter())
     sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    sh.setFormatter(RedactingFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
     sh.addFilter(RedactingFilter())
     root.addHandler(fh)
     root.addHandler(sh)

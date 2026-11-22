@@ -243,7 +243,8 @@ class RiskEngine:
         d.add("free_margin", free_after >= cfg.min_free_margin,
               f"free margin after trade {free_after:.2f} < {cfg.min_free_margin}")
         if cfg.min_risk_reward > 0 and p.take_profits:
-            rr = abs(p.take_profits[0] - p.entry) / abs(p.entry - p.stop_loss)
+            sl_dist = abs(p.entry - p.stop_loss)
+            rr = abs(p.take_profits[0] - p.entry) / sl_dist if sl_dist > 0 else 0.0
             d.add("risk_reward", rr >= cfg.min_risk_reward,
                   f"R:R {rr:.2f} < {cfg.min_risk_reward}")
         return d
@@ -261,7 +262,7 @@ def position_open_risk(gw: MT5Gateway, pos: Position) -> float:
     p = gw.calc_profit(pos.type, pos.symbol, pos.volume, pos.price_open, pos.sl)
     if p is None:
         spec = gw.symbol_spec(pos.symbol)
-        if spec is None:
+        if spec is None or not spec.trade_tick_size:
             return float("inf")
         sign = 1 if pos.type == 0 else -1
         p = sign * (pos.sl - pos.price_open) / spec.trade_tick_size * \

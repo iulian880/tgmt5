@@ -31,7 +31,7 @@ _SL_RE = re.compile(
 _TP_RE = re.compile(
     rf"(?:\bT\s*/\s*P|\bTP|\bTAKE\s*-?\s*PROFIT|\bTARGET)S?\s*(?:(\d)(?![\d.]))?\s*[:=@\-–.)]*\s*"
     rf"({NUM}(?:\s*(?:/|\||,|AND|&)\s*{NUM})*)")
-_TP_OPEN_RE = re.compile(r"\bTP\s*\d?\s*[:=\-]?\s*OPEN\b")
+_TP_OPEN_RE = re.compile(r"\b(?:TP|TAKE\s*-?\s*PROFIT)\s*\d?\s*[:=\-]?\s*OPEN\b")
 _DIR_RE = re.compile(r"\b(BUY|SELL|LONG|SHORT)\b")
 _ORDER_TYPE_RE = re.compile(r"\b(BUY|SELL)\s*(LIMIT|STOP)\b")
 _MARKET_RE = re.compile(r"\b(NOW|MARKET|CMP|INSTANT|MKT|IMMEDIATELY)\b")
@@ -79,8 +79,10 @@ _CLOSE_RE = re.compile(
     r"\b(CLOSE|EXIT)\s+(ALL|NOW|IT|EVERYTHING|FULL(?:Y)?|AT\s+MARKET|EARLY|"
     r"(?:THE\s+|MY\s+|YOUR\s+|THIS\s+|OUR\s+)?(?:TRADES?|POSITIONS?|ORDERS?))\b"
     r"|^\W*(?:PLEASE\s+)?(CLOSE|EXIT)\b(?!\s+(?:TO|IN|BY|ENOUGH|CALL|ONE)\b)")
-# "close at 2665", "exit if it breaks 1.0850": a condition the app cannot watch -> manual review
-_COND_CLOSE_RE = re.compile(r"\b(CLOSE|EXIT)\b(?:\s+[A-Z]+){0,3}?\s+(IF|WHEN|ONCE|ABOVE|BELOW|AT\s+\d)")
+# "close at 2665", "exit if it breaks 1.0850", "close 50% when it reaches 2670",
+# "move SL to BE if TP1 hits": a condition the app cannot watch -> manual review
+_COND_CLOSE_RE = re.compile(r"\b(CLOSE|EXIT)\b(?:\s+[A-Z0-9%]+){0,3}?\s+(IF|WHEN|ONCE|ABOVE|BELOW|AT\s+\d)")
+_COND_TRIGGER_RE = re.compile(r"\b(IF|WHEN|ONCE|AFTER|UNLESS)\b")
 _CANCEL_RE = re.compile(
     r"^\W*(?:PLEASE\s+)?(CANCEL|DELETE|REMOVE)\b"
     r"(?!\s+(?:THIS\s+|THE\s+|YOUR\s+|OUR\s+)?(?:CHANNEL|GROUP|CHAT|MESSAGE|POST|ACCOUNT|APP|EMOTIONS?))"
@@ -88,7 +90,7 @@ _CANCEL_RE = re.compile(
     r"(?:PENDING|LIMITS?|STOPS?|ORDERS?|ENTRY|ENTRIES|SIGNAL|SETUP|TRADE|BUY|SELL)\b"
     r"|\b(PENDING|LIMIT|ORDER|SIGNAL|SETUP|ENTRY|TRADE|BUY\s+STOP|SELL\s+STOP)\b[^.!?\n]{0,20}?"
     r"\b(CANCELL?ED|DELETED|REMOVED)\b")
-_TP_HIT_RE = re.compile(r"\bTP\s*(\d)?\s*(HIT|REACHED|DONE|SMASHED|✅)")
+_TP_HIT_RE = re.compile(r"\bTP\s*(\d)?\s*(?:(HIT|REACHED|DONE|SMASHED)\b|✅)")
 _SL_HIT_RE = re.compile(r"\b(SL|STOP\s*LOSS)\s*(HIT|REACHED|TRIGGERED)\b")
 
 
@@ -109,6 +111,7 @@ def _normalize(text: str) -> str:
     # drop emojis / pictographs but keep ✅ which some providers use for "hit"
     t = "".join(ch if (ch == "✅" or ch == "\n" or not unicodedata.category(ch).startswith("S")
                        or ch in "@$&%/|~=:+-") else " " for ch in t)
+    t = re.sub(r"[ \t]+", " ", t)
     return t
 
 
@@ -250,6 +253,8 @@ class SignalParser:
             if len(set(zones)) > 1 or singles:
                 return ambiguous("multiple entry prices/zones")
             lo, hi = sorted(zones[0])
+            if lo <= 0:
+                return ambiguous("entry zone must be positive")
             if lo == hi:
                 entry_price = lo
             else:
@@ -313,9 +318,21 @@ class SignalParser:
             return mk(ManagementType.SL_HIT, MessageKind.INFO)
         if _NEG_RE.search(norm):
             return None             # "don't close", "do not delete" ...: never act on a negation
+
+        conditional = bool(_COND_TRIGGER_RE.search(norm))
+
+        def maybe_cond(result: ParseResult, cond_extra: bool = False) -> ParseResult:
+            if conditional or cond_extra:
+                return ParseResult(MessageKind.AMBIGUOUS,
+                                   reasons=("conditional instruction (price or condition) - apply it manually",))
+            return result
+
         if _CANCEL_RE.search(norm):
-            return mk(ManagementType.CANCEL_PENDING)
+            return maybe_cond(mk(ManagementType.CANCEL_PENDING))
         if m := _PARTIAL_RE.search(norm):
+            if conditional or _COND_CLOSE_RE.search(norm):
+                return ParseResult(MessageKind.AMBIGUOUS,
+                                   reasons=("conditional close (price or condition) - apply it manually",))
             pct = float(m.group(2))
             if not 0 < pct <= 100:
                 return ParseResult(MessageKind.AMBIGUOUS, reasons=("invalid close percentage",))
@@ -323,18 +340,29 @@ class SignalParser:
                 return mk(ManagementType.CLOSE_ALL)
             return mk(ManagementType.CLOSE_PARTIAL, fraction=pct / 100)
         if _HALF_RE.search(norm):
-            return mk(ManagementType.CLOSE_PARTIAL, fraction=0.5)
+            return maybe_cond(mk(ManagementType.CLOSE_PARTIAL, fraction=0.5),
+                              bool(_COND_CLOSE_RE.search(norm)))
         if m := _MOD_SL_RE.search(norm):
-            return mk(ManagementType.MODIFY_SL, price=float(m.group(3)))
+            if _BAD_COMMA_RE.search(norm):
+                return ParseResult(MessageKind.AMBIGUOUS, reasons=("ambiguous comma in number",))
+            price = float(m.group(3))
+            if price <= 0:
+                return ParseResult(MessageKind.AMBIGUOUS, reasons=("stop loss must be positive",))
+            return maybe_cond(mk(ManagementType.MODIFY_SL, price=price))
         if _BE_RE.search(norm):
-            return mk(ManagementType.MOVE_SL_BE)
+            return maybe_cond(mk(ManagementType.MOVE_SL_BE))
         if m := _MOD_TP_RE.search(norm):
-            return mk(ManagementType.MODIFY_TP, price=float(m.group(3)))
+            if _BAD_COMMA_RE.search(norm):
+                return ParseResult(MessageKind.AMBIGUOUS, reasons=("ambiguous comma in number",))
+            price = float(m.group(3))
+            if price <= 0:
+                return ParseResult(MessageKind.AMBIGUOUS, reasons=("take profit must be positive",))
+            return maybe_cond(mk(ManagementType.MODIFY_TP, price=price))
         if _COND_CLOSE_RE.search(norm) and _CLOSE_RE.search(norm):
             return ParseResult(MessageKind.AMBIGUOUS,
                                reasons=("conditional close (price or condition) - apply it manually",))
         if _CLOSE_RE.search(norm) and not _PROMO_RE.search(norm):
-            return mk(ManagementType.CLOSE_ALL)
+            return maybe_cond(mk(ManagementType.CLOSE_ALL))
         return None
 
 
@@ -349,18 +377,28 @@ def _asdict(s: ParsedSignal) -> dict:
 def validate_geometry(sig: ParsedSignal, max_dist: float = 0.20) -> list[str]:
     """Static consistency checks between direction, entry, SL and TPs."""
     problems: list[str] = []
+    if sig.stop_loss <= 0:
+        problems.append("stop loss must be positive")
+        return problems
     d = sig.direction.sign
     ref = sig.reference_entry
-    if sig.entry_low is not None:
-        # SL must be outside the whole zone
+    if ref is not None and ref <= 0:
+        problems.append("entry price must be positive")
+        return problems
+    if sig.entry_low is not None and sig.entry_high is not None:
+        # SL must be outside the whole zone; TPs must be beyond the zone on the profit side
         worst = sig.entry_low if d > 0 else sig.entry_high
         if d * (worst - sig.stop_loss) <= 0:
             problems.append("stop loss inside or on the wrong side of the entry zone")
     elif ref is not None and d * (ref - sig.stop_loss) <= 0:
         problems.append("stop loss on the wrong side of entry")
     anchor = ref if ref is not None else sig.stop_loss
+    tp_floor = (sig.entry_high if d > 0 else sig.entry_low) if sig.entry_low is not None else ref
     for tp in sig.take_profits:
-        if ref is not None and d * (tp - ref) <= 0:
+        if tp <= 0:
+            problems.append(f"take profit {tp} must be positive")
+            continue
+        if tp_floor is not None and d * (tp - tp_floor) <= 0:
             problems.append(f"take profit {tp} on the wrong side of entry")
         if d * (tp - sig.stop_loss) <= 0:
             problems.append(f"take profit {tp} not beyond stop loss")
@@ -368,6 +406,4 @@ def validate_geometry(sig: ParsedSignal, max_dist: float = 0.20) -> list[str]:
             problems.append(f"take profit {tp} implausibly far from entry")
     if ref is not None and abs(ref - sig.stop_loss) / ref > max_dist:
         problems.append("stop loss implausibly far from entry")
-    if sig.stop_loss <= 0:
-        problems.append("stop loss must be positive")
     return problems

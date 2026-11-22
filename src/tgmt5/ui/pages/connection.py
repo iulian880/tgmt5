@@ -344,7 +344,26 @@ class ConnectionPage(Page):
         except Exception as e:  # noqa: BLE001
             Toast.show_error(f"Invalid configuration: {e}")
             return
-        run_async(self.svc.save_config(cfg), lambda _: Toast.show_message("Configuration imported", "profit"))
+        run_async(self.svc.save_config(cfg, imported=True),
+                  lambda _: Toast.show_message("Configuration imported", "profit"))
+
+    def on_event(self, kind: str, data: dict) -> None:
+        if kind == "config" and data.get("imported"):
+            c = self.svc.config.mt5
+            self.path.setCurrentText(c.terminal_path)
+            self.login.setText(str(c.login or ""))
+            self.server.setText(c.server or "ICMarketsSC-Demo")
+            self.suffix.setText(c.symbol_suffix)
+            self.allow_real.setChecked(c.allow_real_account)
+            p = self.svc.config.paper
+            self.p_bal.setValue(p.starting_balance)
+            self.p_spread.setValue(p.extra_spread_points)
+            self.p_slip.setValue(p.slippage_points)
+            self.p_comm.setValue(p.commission_per_lot)
+            n = self.svc.config.notifications
+            self.n_desk.setChecked(n.desktop)
+            self.n_tg.setText(n.telegram_destination)
+            self.theme.setCurrentText(self.svc.config.theme)
 
     def refresh(self, s: Snapshot) -> None:
         allowed = self.svc.config.mt5.allow_real_account

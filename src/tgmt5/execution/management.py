@@ -20,7 +20,7 @@ from tgmt5.execution.legs import LegState
 from tgmt5.mt5.interface import (
     ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN, SYMBOL_FILLING_FOK,
     SYMBOL_FILLING_IOC, TRADE_ACTION_DEAL, TRADE_ACTION_MODIFY, TRADE_ACTION_REMOVE,
-    TRADE_ACTION_SLTP, OrderType, Retcode, TradeRequest, TradeResult,
+    TRADE_ACTION_SLTP, GatewayError, OrderType, Retcode, TradeRequest, TradeResult,
 )
 from tgmt5.persistence.models import ExecutionRow, SignalEventRow, SignalRow, TelegramMessageRow
 from tgmt5.risk.sizing import floor_to_step, step_decimals
@@ -110,17 +110,21 @@ def close_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, volume: flo
     tick = gw.tick(leg.symbol)
     if spec is None or tick is None or not leg.position_ticket:
         return False, "no price/spec/ticket"
-    volume = floor_to_step(min(volume, leg.volume - leg.closed_volume), spec.volume_step)
-    if volume < spec.volume_min - 1e-9:
-        return False, f"volume {volume} below broker minimum"
-    remaining = round(leg.volume - leg.closed_volume - volume, step_decimals(spec.volume_step))
-    if 0 < remaining < spec.volume_min - 1e-9:
-        volume = round(leg.volume - leg.closed_volume, step_decimals(spec.volume_step))
     buy = leg.direction == "BUY"
     before = next((p for p in gw.positions(leg.symbol) if p.ticket == leg.position_ticket), None)
     if before is None:
         sync_leg(eng, s, leg)
         return False, "position already closed"
+    # Sync with actual broker volume in case the position was partially closed manually in MT5.
+    open_vol = min(leg.volume - leg.closed_volume, before.volume)
+    if before.volume < leg.volume - leg.closed_volume - 1e-9:
+        leg.closed_volume = round(max(0.0, leg.volume - before.volume), 8)
+    volume = floor_to_step(min(volume, open_vol), spec.volume_step)
+    if volume < spec.volume_min - 1e-9:
+        return False, f"volume {volume} below broker minimum"
+    remaining = round(open_vol - volume, step_decimals(spec.volume_step))
+    if 0 < remaining < spec.volume_min - 1e-9:
+        volume = round(open_vol, step_decimals(spec.volume_step))
     for filling in _fillings(spec):
         req = TradeRequest(action=TRADE_ACTION_DEAL, symbol=leg.symbol, volume=volume,
                            type=OrderType.SELL if buy else OrderType.BUY,
@@ -132,10 +136,15 @@ def close_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, volume: flo
         if res.retcode == Retcode.INVALID_FILL:
             continue
         if res.uncertain:
-            after = next((p for p in gw.positions(leg.symbol) if p.ticket == leg.position_ticket), None)
+            try:
+                after = next((p for p in gw.positions(leg.symbol) if p.ticket == leg.position_ticket), None)
+            except GatewayError:
+                return False, "close outcome unknown; broker unreachable - not retried"
             done = after is None or after.volume < before.volume - 1e-9
             if not done:
                 return False, "close outcome unknown; position unchanged - not retried"
+            closed_amt = before.volume if after is None else round(before.volume - after.volume, 8)
+            volume = min(volume, closed_amt)
         elif not res.ok:
             return False, res.text
         leg.closed_volume = round(leg.closed_volume + volume, 8)
@@ -147,32 +156,37 @@ def close_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, volume: flo
     return False, "no supported filling mode"
 
 
-def modify_leg_sl(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, new_sl: float,
+def modify_leg_sl(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, new_sl: float | None,
                   reason: str, new_tp: float | None = None) -> tuple[bool, str]:
     gw = eng.gw
     spec = gw.symbol_spec(leg.symbol)
     tick = gw.tick(leg.symbol)
     if spec is None or tick is None:
         return False, "no price/spec"
-    new_sl = round(new_sl, spec.digits)
-    tp = leg.tp if new_tp is None else new_tp
+    sl_val = round(new_sl, spec.digits) if new_sl else 0.0
+    tp_val = round(leg.tp, spec.digits) if (new_tp is None and leg.tp) else (
+        round(new_tp, spec.digits) if new_tp else 0.0)
     buy = leg.direction == "BUY"
     min_dist = spec.trade_stops_level * spec.point
     if leg.state == LegState.PENDING.value:
         req = TradeRequest(action=TRADE_ACTION_MODIFY, symbol=leg.symbol, order=leg.order_ticket,
-                           price=leg.requested_price or 0.0, sl=new_sl, tp=tp or 0.0)
+                           price=leg.requested_price or 0.0, sl=sl_val, tp=tp_val)
     else:
         ref = tick.bid if buy else tick.ask
-        if (buy and new_sl >= ref - min_dist) or (not buy and new_sl <= ref + min_dist):
-            return False, f"SL {new_sl} not valid vs current price {ref}"
+        if sl_val and ((buy and sl_val >= ref - min_dist) or (not buy and sl_val <= ref + min_dist)):
+            return False, f"SL {sl_val} not valid vs current price {ref}"
+        if new_tp is not None and tp_val:
+            if (buy and tp_val <= ref + min_dist) or (not buy and tp_val >= ref - min_dist):
+                return False, f"TP {tp_val} not valid vs current price {ref}"
         req = TradeRequest(action=TRADE_ACTION_SLTP, symbol=leg.symbol,
-                           position=leg.position_ticket, sl=new_sl, tp=tp or 0.0,
+                           position=leg.position_ticket, sl=sl_val, tp=tp_val,
                            magic=eng.cfg.execution.magic_number)
-    res = _send(eng, req, f"modify {leg.client_tag} SL->{new_sl} ({reason})")
+    res = _send(eng, req, f"modify {leg.client_tag} SL->{sl_val} ({reason})")
     if res.ok or res.retcode == Retcode.NO_CHANGES:
-        leg.sl = new_sl
+        if new_sl is not None:
+            leg.sl = sl_val or None
         if new_tp is not None:
-            leg.tp = new_tp
+            leg.tp = tp_val or None
         return True, "modified"
     return False, res.text
 
@@ -269,6 +283,9 @@ def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementI
 
         elif t is ManagementType.MODIFY_TP:
             assert instr.price is not None
+            ref_entry = sig.entry_price or sig.entry_low or sig.stop_loss
+            if instr.price <= 0 or (ref_entry and abs(instr.price - ref_entry) / ref_entry > 0.2):
+                return False, "new TP implausible"
             live = open_legs + pending
             if len({l.tp for l in live}) > 1:
                 return False, "ambiguous: several TP legs - confirm manually which to change"
@@ -310,7 +327,7 @@ def sync_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow,
             return
         now = eng.clock().timestamp()
         deals = [d for d in gw.history_deals(now - 86400 * 30, now + 86400)
-                 if d.comment == leg.client_tag and d.entry == 0]
+                 if d.comment == leg.client_tag and d.magic == magic and d.entry == 0]
         if deals:
             leg.state, leg.position_ticket = LegState.OPEN.value, deals[0].position_id
             leg.fill_price = deals[0].price
@@ -323,6 +340,8 @@ def sync_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow,
     pos = positions.get(leg.position_ticket)
     if pos is not None:
         leg.sl, leg.tp = pos.sl or leg.sl, pos.tp or leg.tp
+        if pos.volume < leg.volume - leg.closed_volume - 1e-9:
+            leg.closed_volume = round(max(0.0, leg.volume - pos.volume), 8)
         return
     # position is gone -> closed (by SL/TP, by us, or manually in the terminal)
     now = eng.clock().timestamp()
@@ -381,6 +400,20 @@ def _manage_signal(eng, s, sig, positions, orders, ex) -> None:
                                      status_to=sig.status, ts=eng.clock(),
                                      message=f"leg {leg.leg_index} closed, P/L {leg.profit}"))
     s.flush()
+    if sig.status == SignalStatus.UNCERTAIN.value and legs and all(
+            l.state != LegState.UNCERTAIN.value for l in legs):
+        live = [l for l in legs if l.state in (LegState.OPEN.value, LegState.PENDING.value,
+                                               LegState.CLOSED.value)]
+        if live and not all(LegState(l.state) in FINAL_LEG for l in legs):
+            if eng.simulated:
+                new_st = SignalStatus.SIMULATED
+            elif len(live) == len(legs):
+                new_st = (SignalStatus.PENDING_PLACED
+                          if all(l.state == LegState.PENDING.value for l in legs)
+                          else SignalStatus.EXECUTED)
+            else:
+                new_st = SignalStatus.PARTIAL
+            eng._transition(s, sig, new_st, "uncertain order(s) reconciled")
     # Monitor-only mode (e.g. right after a restart or an update) cannot send orders:
     # keep tracking the legs but leave breakeven / partials / trailing for later, so they
     # are applied as soon as execution is switched back on instead of being marked done.
@@ -444,8 +477,10 @@ def _managed_partials(eng, s, sig, legs, ex) -> None:
         if i + 1 == ex.move_sl_to_be_after_tp and leg.state == LegState.OPEN.value and not leg.be_applied:
             off = ex.breakeven_offset_points * spec.point
             entry = leg.fill_price or leg.requested_price
-            okb, _ = modify_leg_sl(eng, s, leg, entry + off if buy else entry - off, f"TP{i + 1}")
+            okb, msgb = modify_leg_sl(eng, s, leg, entry + off if buy else entry - off, f"TP{i + 1}")
             leg.be_applied = True
+            if not okb:
+                eng.audit_app("WARNING", "management", f"{leg.client_tag}: breakeven failed: {msgb}")
     sig.management = {**m, "done": done}
 
 

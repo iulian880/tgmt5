@@ -292,8 +292,13 @@ class AppService:
             return
         self.engine.audit_app("INFO", "mt5", "attempting MT5 reconnect")
         try:
-            self.real_gw.connect(self._connect_params)
-            self.last_recovery = recover(self.engine)
+            acct = self.real_gw.connect(self._connect_params)
+            if self.engine.resolver is not None:
+                self.engine.resolver.refresh()
+            if self.engine.mode is ExecutionMode.PAPER:
+                self.last_recovery = recover(self.engine)
+            else:
+                self.last_recovery = recover(self._recovery_engine(self._broker_mode(acct), self.real_gw))
         except LiveAccountBlocked as e:
             self.risk.emergency(str(e))
             self.engine.audit_app("CRITICAL", "safety", str(e))
@@ -493,21 +498,41 @@ class AppService:
 
     # ------------------------------------------------------------- safety
     async def emergency_stop(self, reason: str = "manual STOP button") -> None:
-        self.risk.emergency(reason)
-        await self.set_mode(ExecutionMode.MONITOR)
-
-        def _cancel_waiting() -> None:
+        def _do() -> None:
+            self.risk.emergency(reason)
+            self.engine.set_mode(ExecutionMode.MONITOR, ReadOnlyGateway(self.real_gw) if self.real_gw else None)
+            if self.real_gw is None:
+                self.engine.set_gateway(None)
             with self.db.session() as s:
                 for sig in s.scalars(select(SignalRow).where(
                         SignalRow.status.in_([SignalStatus.WAITING.value, SignalStatus.QUEUED.value]))):
                     self.engine._transition(s, sig, SignalStatus.CANCELLED, "emergency stop")
-        await self.run_mt5(_cancel_waiting)
-        self.engine.audit_app("CRITICAL", "safety", f"EMERGENCY STOP: {reason}")
+            self.engine.audit_app("CRITICAL", "safety", f"EMERGENCY STOP: {reason}")
+        await self.run_mt5(_do)
         self._emit("mode", {"mode": "MONITOR"})
 
     async def clear_emergency(self) -> None:
-        self.risk.clear_emergency()
-        self.engine.audit_app("WARNING", "safety", "Emergency stop cleared by user (mode stays MONITOR)")
+        def _do() -> None:
+            self.risk.clear_emergency()
+            self.engine.audit_app("WARNING", "safety", "Emergency stop cleared by user (mode stays MONITOR)")
+        await self.run_mt5(_do)
+
+    async def reset_breaker(self) -> None:
+        def _do() -> None:
+            self.risk.reset_breaker()
+            self.engine.audit_app("WARNING", "risk", "Consecutive-loss breaker reset by user")
+        await self.run_mt5(_do)
+
+    async def reset_drawdown_lockout(self) -> float:
+        def _do() -> float:
+            acct = self.engine.refresh_account()
+            if acct is None:
+                raise ValueError("Connect MT5 first")
+            self.risk.reset_drawdown_lockout(acct.equity)
+            self.engine.audit_app("WARNING", "risk",
+                                  f"Drawdown lockout reset by user (new peak {acct.equity:,.2f})")
+            return acct.equity
+        return await self.run_mt5(_do)
 
     async def flatten_all(self) -> list[str]:
         """Close every position / pending order OWNED BY THIS APP (by magic + tracked legs)."""
@@ -542,6 +567,10 @@ class AppService:
                 gw = self.engine.gw
                 if isinstance(gw, ReadOnlyGateway):
                     gw = self.real_gw
+                if gw is None:
+                    return False, "MT5 not connected"
+                if bool(leg.is_simulated) != (gw is self.paper_gw):
+                    return False, "position belongs to another mode (PAPER vs broker)"
                 eng = self._recovery_engine(self.engine.mode if self.engine.mode is not
                                             ExecutionMode.MONITOR else self._broker_mode(), gw)
                 return close_leg(eng, s, leg, leg.volume - leg.closed_volume, "manual close")
@@ -558,6 +587,10 @@ class AppService:
                 gw = self.engine.gw
                 if isinstance(gw, ReadOnlyGateway):
                     gw = self.real_gw
+                if gw is None:
+                    return False, "MT5 not connected"
+                if bool(leg.is_simulated) != (gw is self.paper_gw):
+                    return False, "position belongs to another mode (PAPER vs broker)"
                 eng = self._recovery_engine(self.engine.mode if self.engine.mode is not
                                             ExecutionMode.MONITOR else self._broker_mode(), gw)
                 return modify_leg_sl(eng, s, leg, sl, "manual modify", new_tp=tp)
@@ -581,21 +614,31 @@ class AppService:
         return await self.run_mt5(_do)
 
     # ------------------------------------------------------------- config
-    async def save_config(self, cfg: AppConfig) -> None:
+    async def save_config(self, cfg: AppConfig, *, imported: bool = False) -> None:
         cfg = AppConfig.model_validate(cfg.model_dump())   # full validation
-        if not cfg.mt5.allow_real_account:
-            # switching real-money trading off takes effect immediately
-            if self.engine.mode is ExecutionMode.LIVE:
-                await self.set_mode(ExecutionMode.MONITOR)
-            if self.risk.state.confirmed_real_account:
+        if not cfg.mt5.allow_real_account and self.engine.mode is ExecutionMode.LIVE:
+            await self.set_mode(ExecutionMode.MONITOR)
+
+        def _do() -> None:
+            if not cfg.mt5.allow_real_account and self.risk.state.confirmed_real_account:
                 self.risk.state.confirmed_real_account = ""
                 self.risk.persist()
-        cfg.mode = self.config.mode
-        self.config = cfg
-        self.db.save_config(cfg)
+            old_suffix = self.config.mt5.symbol_suffix
+            cfg.mode = self.config.mode
+            self.config = cfg
+            self.db.save_config(cfg)
+            if self.engine.resolver is not None and cfg.mt5.symbol_suffix != old_suffix:
+                self.engine.resolver.suffix = cfg.mt5.symbol_suffix
+                self.engine.resolver.refresh()
+            if self.paper_gw is not None:
+                self.paper_gw.extra_spread_points = cfg.paper.extra_spread_points
+                self.paper_gw.slippage_points = cfg.paper.slippage_points
+                self.paper_gw.commission_per_lot = cfg.paper.commission_per_lot
+            self.engine.audit_app("INFO", "config",
+                                  "Configuration imported" if imported else "Configuration saved")
+        await self.run_mt5(_do)
         await self.telegram.update_chats(self.enabled_chat_ids())
-        self.engine.audit_app("INFO", "config", "Configuration saved")
-        self._emit("config", {})
+        self._emit("config", {"imported": imported})
 
     async def sizing_preview(self, cfg: AppConfig, *, fallback_balance: float, sl_pips: float,
                              n_tps: int, recent: bool) -> SizingPreview:
@@ -638,6 +681,8 @@ class AppService:
         gw = self.engine.gw
         acct = gw.account_info() if gw else None
         connected = bool(self.real_gw and self.real_gw.is_connected())
+        real_acct = (acct if gw is self.real_gw else self.real_gw.account_info()) if connected else None
+        confirm_acct = real_acct or acct
         tg = self.telegram.status
         snap = Snapshot(
             mode=self.engine.mode.value, sandbox=self.sandbox, account=acct, mt5_connected=connected,
@@ -645,11 +690,12 @@ class AppService:
                       "latency_ms": tg.latency_ms, "reconnects": tg.reconnects,
                       "messages": tg.messages_received, "avg_delivery_ms": tg.avg_delivery_ms},
             blocking_reason=self.risk.blocking_reason(), emergency=self.risk.state.emergency_stop,
-            confirmed=bool(acct and (self.risk.state.confirmed_real_account if not acct.is_demo else
-                                     self.risk.state.confirmed_account) == f"{acct.login}@{acct.server}"),
-            queue_depth=self.queue.qsize())
+            confirmed=bool(confirm_acct and (self.risk.state.confirmed_real_account
+                                             if not confirm_acct.is_demo
+                                             else self.risk.state.confirmed_account)
+                           == f"{confirm_acct.login}@{confirm_acct.server}"),
+            queue_depth=self.queue.qsize(), real_account=real_acct)
         if connected:
-            snap.real_account = acct if gw is self.real_gw else self.real_gw.account_info()
             ti = self.real_gw.terminal_info()
             snap.algo_trading = bool(ti.trade_allowed) if ti else None
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -671,7 +717,12 @@ class AppService:
             if gw is not None and acct is not None:
                 from tgmt5.risk.engine import position_open_risk
                 magic = self.config.execution.magic_number
-                for p in gw.positions():
+                try:
+                    gw_positions = gw.positions()
+                    gw_orders = gw.orders()
+                except GatewayError:
+                    gw_positions, gw_orders = [], []
+                for p in gw_positions:
                     if p.magic != magic:
                         continue
                     leg = legs.get(p.ticket)
@@ -683,7 +734,7 @@ class AppService:
                         "volume": p.volume, "price_open": p.price_open, "price_current": p.price_current,
                         "sl": p.sl, "tp": p.tp, "profit": p.profit, "risk": r, "opened": p.time,
                         "signal_id": leg.signal_id if leg else None, "leg_id": leg.id if leg else None})
-                for o in gw.orders():
+                for o in gw_orders:
                     if o.magic != magic:
                         continue
                     leg = pend.get(o.ticket)

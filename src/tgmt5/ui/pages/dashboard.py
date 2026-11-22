@@ -72,6 +72,7 @@ class DashboardPage(Page):
         self.body.addWidget(ResponsiveRow(c1, c2, breakpoint=760))
         self.body.addWidget(ResponsiveRow(c3, c4, c5, breakpoint=900))
         self._last_stats = 0.0
+        self._last_sim: bool | None = None
 
     def refresh(self, s: Snapshot) -> None:
         a = s.account
@@ -129,19 +130,21 @@ class DashboardPage(Page):
         self.risk_meter.set(frac)
         self.risk_text.setText(f"Open risk {money(s.open_risk)} of {money(s.open_risk_cap)} allowed "
                                f"({frac * 100:.0f}%)")
-        if time.monotonic() - self._last_stats > 15:
+        if self._last_sim != sim or time.monotonic() - self._last_stats > 15:
             self._last_stats = time.monotonic()
+            self._last_sim = sim
             self._refresh_stats(sim)
 
     def _refresh_stats(self, sim: bool) -> None:
         st = compute(self.svc.db, simulated=sim)
         self.eq.set_data(st.equity_curve)
+        dd = []
         if st.equity_curve:
-            peak, dd = 0.0, []
+            peak = 0.0
             for ts, e in st.equity_curve:
                 peak = max(peak, e)
                 dd.append((ts, -(peak - e) / peak * 100 if peak else 0))
-            self.dd.set_data(dd, baseline=0)
+        self.dd.set_data(dd, baseline=0)
         self.pnl.set_data(st.daily_pnl[-14:])
         self.donut.set(st.wins, st.losses)
         self.dist.set_data(sorted(((k, v["trades"]) for k, v in st.per_symbol.items()),

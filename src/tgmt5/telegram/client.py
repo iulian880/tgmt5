@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Protocol
 
+from tgmt5 import __version__
 from tgmt5.domain.models import MessageEventType, TelegramMessage
 from tgmt5.secrets import SecretStore
 
@@ -85,7 +86,7 @@ class TelethonSource:
         return TelegramClient(StringSession(session), int(api_id), api_hash,
                               auto_reconnect=True, connection_retries=None, retry_delay=3,
                               request_retries=3, catch_up=False,
-                              device_model="TGMT5 Desktop", app_version="0.1")
+                              device_model="TGMT5 Desktop", app_version=__version__)
 
     async def connect(self) -> bool:
         if self.client is None:
@@ -128,8 +129,12 @@ class TelethonSource:
         self.secrets.set(SecretStore.TG_SESSION, self.client.session.save())
 
     async def logout(self) -> None:
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
         if self.client:
             await self.client.log_out()
+            self.client = None
         self.secrets.delete(SecretStore.TG_SESSION)
         self.status = TelegramStatus()
 
@@ -141,9 +146,14 @@ class TelethonSource:
         self._on_message = on_message
         self._chat_ids = set(chat_ids)
         c = self.client
+        # Remove any previous handlers so restarting the listener never duplicates messages.
+        for fn in (self._on_new, self._on_edit, self._on_deleted):
+            c.remove_event_handler(fn)
         c.add_event_handler(self._on_new, events.NewMessage())
         c.add_event_handler(self._on_edit, events.MessageEdited())
         c.add_event_handler(self._on_deleted, events.MessageDeleted())
+        if self._watch_task:
+            self._watch_task.cancel()
         self._watch_task = asyncio.create_task(self._watchdog())
         log.info("Telegram listening on %d chats", len(self._chat_ids))
 
@@ -153,6 +163,7 @@ class TelethonSource:
     async def stop(self) -> None:
         if self._watch_task:
             self._watch_task.cancel()
+            self._watch_task = None
         if self.client:
             await self.client.disconnect()
         self.status.connected = False

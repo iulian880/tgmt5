@@ -347,6 +347,7 @@ class SimBroker(MT5Gateway):
                     existing.sl, existing.tp = sl or existing.sl, tp or existing.tp
                     self._record_deal(order_id, existing.ticket, symbol, side, 0, volume, price, 0.0,
                                       commission, magic, comment)
+                    self.balance += commission
                     return TradeResult(retcode=Retcode.DONE, order=order_id,
                                        deal=self.deals[-1].ticket, volume=volume, price=price)
                 closing = min(volume, existing.volume)

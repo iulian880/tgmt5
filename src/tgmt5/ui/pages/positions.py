@@ -184,5 +184,5 @@ class PositionsPage(Page):
         if sl.value() <= 0:
             Toast.show_error("A stop loss is mandatory")
             return
-        run_async(self.svc.modify_position(p["leg_id"], sl.value(), tp.value() or None),
+        run_async(self.svc.modify_position(p["leg_id"], sl.value(), tp.value()),
                   lambda r: Toast.show_message(r[1], "profit" if r[0] else "loss"))

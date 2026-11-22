@@ -216,6 +216,10 @@ class SourcesPage(Page):
         cfg.sources = out
         run_async(self.svc.save_config(cfg), lambda _: Toast.show_message("Sources saved", "profit"))
 
+    def on_event(self, kind: str, data: dict) -> None:
+        if kind == "config" and data.get("imported"):
+            self._load_sources()
+
     def refresh(self, s: Snapshot) -> None:
         tg = s.telegram
         self.dot.set_tone("profit" if tg["connected"] and tg["authorized"] else

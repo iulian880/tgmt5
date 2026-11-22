@@ -237,6 +237,8 @@ class AppConfig(_Strict):
     @classmethod
     def import_json(cls, text: str) -> "AppConfig":
         data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("configuration JSON must be an object")
         data.pop("mode", None)
         data.pop("reviewed", None)      # imported settings must be reviewed again by this user
         if isinstance(data.get("mt5"), dict):
