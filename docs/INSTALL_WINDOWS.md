@@ -1,6 +1,6 @@
 # Windows installation
 
-The quickest way is to download `TGMT5-Setup-<version>.exe` (installer) or `TGMT5-Portable-<version>.exe` (no install) from the [latest release](https://github.com/iulian880/telegram-mt5-copier/releases/latest). The sections [Install with the setup file](#install-with-the-setup-file) and [Portable version](#portable-version-no-installation) below explain both. The rest of this page covers running and building from source.
+The quickest way is to download `TGMT5-Setup-<version>.exe` (installer) or `TGMT5-Portable-<version>.exe` (no install) from the [latest release](https://github.com/iulian880/tgmt5/releases/latest). The sections [Install with the setup file](#install-with-the-setup-file) and [Portable version](#portable-version-no-installation) below explain both. The rest of this page covers running and building from source.
 
 ## Requirements
 - Windows 10/11 (64-bit)
@@ -10,8 +10,8 @@ The quickest way is to download `TGMT5-Setup-<version>.exe` (installer) or `TGMT
 
 ## Install from source
 ```powershell
-git clone https://github.com/iulian880/telegram-mt5-copier
-cd telegram-mt5-copier
+git clone https://github.com/iulian880/tgmt5
+cd tgmt5
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"     # also installs MetaTrader5 on Windows

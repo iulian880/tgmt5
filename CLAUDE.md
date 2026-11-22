@@ -4,7 +4,7 @@ Python 3.12+ desktop app (PySide6 + qasync) that parses Telegram signals and pla
 
 ## Commands
 - Local setup on this Mac (Homebrew Python 3.15 has no PySide6 wheels): `uv venv --python 3.13 .venv && uv pip install --python .venv -e ".[dev]"`
-- Tests (local): `QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q` (257 tests, no credentials or broker)
+- Tests (local): `QT_QPA_PLATFORM=offscreen .venv/bin/pytest -q` (299 tests, no credentials or broker)
 - CI `tests.yml` (push/PR, ubuntu + windows, Python 3.12–3.14): `pip install -e ".[dev]"` then `pytest -q`
 - CI `build.yml` (PR, push to main; windows-latest): `packaging\build_windows.ps1` (pytest, PyInstaller, signing), `build_portable.ps1`, `build_installer.ps1`, then a `--sandbox` smoke test of the portable exe. The Windows exes cannot be built on macOS.
 - Run without a broker or Telegram (any OS): `python -m tgmt5 --sandbox`

@@ -1,51 +1,104 @@
 """Render README screenshots from SANDBOX mode (simulated broker + Telegram feed).
 
-    QT_QPA_PLATFORM=offscreen python scripts/screenshots.py docs/screenshots
+    QT_QPA_PLATFORM=offscreen .venv/bin/python scripts/screenshots.py docs/screenshots 45
+    TGMT5_THEME=light QT_QPA_PLATFORM=offscreen .venv/bin/python scripts/screenshots.py docs/screenshots/light 45
 """
 import asyncio
 import os
+import random
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-os.environ.setdefault("TGMT5_SANDBOX_INTERVAL", "2.5")
-os.environ.setdefault("TGMT5_SANDBOX_VOL", "2.5")
+os.environ.setdefault("TGMT5_SANDBOX_INTERVAL", "2.0")
+os.environ.setdefault("TGMT5_SANDBOX_VOL", "2.2")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 import qasync  # noqa: E402
 
 from tgmt5.__main__ import _sandbox_tasks, build_service  # noqa: E402
 from tgmt5.domain.models import ExecutionMode  # noqa: E402
+from tgmt5.sandbox import SANDBOX_CHAT  # noqa: E402
 from tgmt5.ui import theme  # noqa: E402
 
 
 async def run(out: Path, seconds: float) -> None:
     from tgmt5.ui.main_window import MainWindow
-    svc = build_service(Path(tempfile.mkdtemp()), sandbox=True)
-    svc.equity_snapshot_seconds = 3
+    random.seed(42)
+    data_dir = Path(tempfile.gettempdir()) / "tgmt5-showcase"
+    shutil.rmtree(data_dir, ignore_errors=True)
+    svc = build_service(data_dir, sandbox=True)
+    svc.equity_snapshot_seconds = 2
     svc.config.risk.max_trades_per_hour = 60
     svc.config.risk.max_concurrent_trades = 8
     svc.config.risk.max_total_open_risk_pct = 6
     svc.config.risk.max_correlated_risk_pct = 5
     svc.config.notifications.desktop = False
     win = MainWindow(svc)
-    win.resize(1560, 1000)
+    win.resize(1560, 1020)
     win.show()
     await svc.start()
-    asyncio.create_task(_sandbox_tasks(svc))
-    await asyncio.sleep(2)
+    await svc.connect_mt5("sandbox")
     await svc.confirm_automated_execution()
     await svc.set_mode(ExecutionMode.DEMO)
+
+    # Run 4 realistic sandbox trades through the real pipeline and close them at TP/SL
+    # so Dashboard (win-rate donut, daily P&L, symbol bars) and History (cumulative curve) are rich.
+    b = svc.sandbox_broker
+    await svc.run_mt5(svc._equity_snapshot)
+    seed_trades = [
+        ("EURUSD", "BUY EURUSD NOW\nSL 1.08200\nTP 1.09000", 1.09020, 1.09028),
+        ("GBPUSD", "SELL GBPUSD NOW\nSL 1.27350\nTP 1.26450", 1.26420, 1.26430),
+        ("USDJPY", "BUY USDJPY NOW\nSL 149.650\nTP 150.650", 149.620, 149.630),  # realistic loss
+        ("XAUUSD", "BUY XAUUSD NOW\nSL 2652\nTP1 2668\nTP2 2674", 2675.0, 2675.15),
+    ]
+    orig_prices = {sym: (b.ticks[sym].bid, b.ticks[sym].ask) for sym, *_ in seed_trades}
+    for sym, text, close_bid, close_ask in seed_trades:
+        await svc.telegram.push(SANDBOX_CHAT, text, title="Sandbox Signals")
+        await svc.queue.join()
+        await asyncio.sleep(0.35)
+        await svc.run_mt5(b.set_price, sym, close_bid, close_ask)
+        await svc.run_mt5(svc._tick)
+        await asyncio.sleep(0.35)
+        await svc.run_mt5(b.set_price, sym, *orig_prices[sym])
+        await svc.run_mt5(svc._equity_snapshot)
+
+    # Now start the live sandbox random-walk & feed + a pending BUY LIMIT
+    from tgmt5 import sandbox as sb
+    feed_task = asyncio.create_task(
+        sb.run_feed(svc.telegram, b, float(os.environ.get("TGMT5_SANDBOX_INTERVAL", "2.0")))
+    )
+
+    async def walk():
+        vol = float(os.environ.get("TGMT5_SANDBOX_VOL", "2.2"))
+        while True:
+            await svc.run_mt5(sb.random_walk, b, vol)
+            await asyncio.sleep(1.0)
+
+    walk_task = asyncio.create_task(walk())
+    await asyncio.sleep(1.0)
+    g = b.ticks["XAUUSD"].ask
+    await svc.telegram.push(
+        SANDBOX_CHAT,
+        f"XAUUSD BUY LIMIT {g - 8:.0f}\nSL: {g - 16:.0f}\nTP1: {g + 4:.0f}\nTP2: {g + 12:.0f}",
+        title="Sandbox Signals",
+    )
     await asyncio.sleep(seconds)
     out.mkdir(parents=True, exist_ok=True)
     for i, (name, _) in enumerate(__import__("tgmt5.ui.main_window", fromlist=["NAV"]).NAV):
         win.goto(i)
+        if name == "Dashboard":
+            win.pages[i]._last_stats = 0.0
         if name == "History":
             win.pages[i].reload()
-        await asyncio.sleep(1.6)
+        await asyncio.sleep(1.8)
         win.grab().save(str(out / f"{i + 1:02d}-{name.lower()}.png"))
         print("saved", name)
+    feed_task.cancel()
+    walk_task.cancel()
     await svc.stop()
+    shutil.rmtree(data_dir, ignore_errors=True)
 
 
 def main() -> None:

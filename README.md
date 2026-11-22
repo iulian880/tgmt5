@@ -1,91 +1,168 @@
-# TGMT5: Telegram → MetaTrader 5 copy trading
+# TGMT5 — Telegram → MetaTrader 5 Copy Trading
 
-A Windows desktop application that reads trading signals from private Telegram groups you belong to, interprets them with a deterministic parser, runs every trade through a risk engine and executes it on **MetaTrader 5**: a DEMO account by default, or a real-money account in the opt-in **REAL ACCOUNT** mode (built and tested against an IC Markets SC account model).
+[![Tests](https://github.com/iulian880/tgmt5/actions/workflows/tests.yml/badge.svg)](https://github.com/iulian880/tgmt5/actions/workflows/tests.yml)
+[![Build Windows exe](https://github.com/iulian880/tgmt5/actions/workflows/build.yml/badge.svg)](https://github.com/iulian880/tgmt5/actions/workflows/build.yml)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+![PySide6 Desktop](https://img.shields.io/badge/UI-PySide6%20%2B%20qasync-41CD52?logo=qt&logoColor=white)
+![Tests: 299 passing](https://img.shields.io/badge/tests-299%20passing-brightgreen)
+[![Latest Release](https://img.shields.io/github/v/release/iulian880/tgmt5?color=informational)](https://github.com/iulian880/tgmt5/releases/latest)
+![Platform: Windows 10 / 11](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-It starts in **monitor-only** mode, refuses real-money accounts at the backend level unless you explicitly allow them and confirm the account by typing its number, and never trades on a signal it cannot interpret with certainty.
+A **Windows desktop application** (Python 3.12+, PySide6 + qasync, SQLite/WAL, Telethon, official MetaTrader5 API) that reads trading signals from private Telegram groups you belong to, interprets them with a **deterministic parser**, validates every trade through a **persisted risk engine**, and executes it on **MetaTrader 5** — **DEMO by default**, or a real-money account in the explicitly gated **REAL ACCOUNT** mode (built and tested against an IC Markets SC account model).
 
-![Dashboard](docs/screenshots/01-dashboard.png)
+It **always starts in monitor-only mode**, refuses real-money accounts at the backend level unless you explicitly opt in and confirm the account by typing its number, commits every order leg to SQLite *before* calling `order_send`, and never guesses on an ambiguous signal.
 
-> **Risk disclaimer.** This is an educational / portfolio project. Real-money trading is off by default; if you turn it on, every loss is yours. Trading leveraged products such as forex and CFDs carries a high risk of losing money. Nothing in this repository is financial advice, and simulated or demo results do not predict live results. Use at your own risk; see [LICENSE](LICENSE).
+![TGMT5 Dashboard](docs/screenshots/01-dashboard.png)
+
+> **Risk disclaimer.** This is an educational / portfolio project. Real-money trading is **off by default**; if you turn it on, every loss is yours. Trading leveraged products such as forex and CFDs carries a high risk of losing money. Nothing in this repository is financial advice, and simulated or demo results do not predict live results. Use at your own risk; see [LICENSE](LICENSE).
+
+---
+
+## Why TGMT5 — engineered for safety over convenience
+
+Most Telegram-to-MT5 copiers either wrap an LLM around raw chat text, assume hard-coded pip values, or fire-and-forget orders without idempotency. `TGMT5` is designed like a small execution system where **every failure mode defaults to doing nothing**:
+
+| Dimension | Typical Telegram copy scripts | LLM / webhook copiers | `TGMT5` |
+|---|---|---|---|
+| **Signal interpretation** | Loose regexes that misread chat as commands | Non-deterministic; can hallucinate SL/TP or price | **Pure deterministic parser** — strict geometry, comma-decimal & conditional guards; anything uncertain goes to **Manual Review** |
+| **Position sizing** | Hard-coded `$10/pip` or fixed lots | Often ignores broker contract specs or multi-TP splits | **Broker-driven `order_calc_profit()`** with tick-value fallback, floor-to-step rounding, 6 sizing modes, and budget split across all TP legs |
+| **Duplicate & timeout safety** | Re-sends on timeout or restart, duplicating trades | Stateless webhooks | **SQLite commit before `order_send`** with unique `TG<sig>L<leg>` tags; `UNCERTAIN` legs reconcile positions, orders & 7-day deals before a single bounded retry |
+| **Account protection** | Trades whatever terminal is logged in | API keys on third-party servers | **Double `AccountGuard`** (connect + every order) + **MONITOR-on-start** + 3-step typed confirmation for `REAL ACCOUNT` + persistent **EMERGENCY STOP** |
+| **Risk lockouts & review** | Optional UI toggles reset on restart | None | **16-rule Risk Engine** (daily loss, drawdown, streak breaker, exposure, margin, sessions) persisted in SQLite + red **Pre-trade review** ticks |
+| **Secrets & auditability** | Plaintext `.env` / JSON files | Cloud-hosted credentials | **OS Keyring only** (Windows Credential Manager) + automatic secret redaction in JSON logs, console tracebacks & SQLite audit trail |
+| **Offline exploration** | Requires live credentials | Requires subscription | Built-in **`--sandbox`** mode (simulated broker + Telegram feed, any OS) and **Paper trading** on live MT5 quotes |
+
+---
 
 ## Highlights
 
-- **Deterministic signal parser.** It handles market, entry-zone, explicit limit/stop and multi-TP signals, symbol aliases (GOLD → XAUUSD), and follow-up commands such as *move SL to BE*, *close 50%*, *cancel pending* and *TP1 hit*. If the symbol, direction, stop loss or entry is uncertain, the message goes to a **manual review queue**. The parser never invents values.
-- **Lot sizing from the broker's own specs.** The loss at the stop is computed with `order_calc_profit()`, so currency conversion, contract size and tick value always come from the terminal. Volumes are rounded **down** to the broker's step, and a signal is rejected if even the minimum lot exceeds the risk budget. The whole risk budget for a signal is split across its TP legs, so three targets never mean three times the risk.
-- **Risk engine.** Limits cover risk per signal and total open risk, a daily-loss lockout, a max-drawdown lockout, a consecutive-loss breaker, trade frequency, concurrent trades, per-symbol and correlated exposure, margin usage, free margin, spread, slippage, entry deviation, R:R, sessions and white/blacklists. Lockouts survive restarts.
-- **Execution without duplicates.** Each order is written to SQLite with a unique client tag *before* it is sent. If the result is a timeout or connection loss, the leg becomes `UNCERTAIN` and is reconciled against MT5 positions, orders and deal history before any retry is allowed.
-- **Account guard, twice.** The account is checked when connecting, and again on *every* trade request (account type, configured login and server). Real-money accounts need three explicit steps: *Allow real-money accounts*, REAL ACCOUNT mode, and a typed confirmation of the account number. In any other mode a real account can only have its positions closed or protected; a new order on it engages a persistent emergency stop.
-- **Restart recovery.** On start-up the app reconciles uncertain orders, positions closed while it was offline, expired waiting signals and unknown positions that carry its magic number. Old Telegram messages are never replayed.
-- **Paper trading** uses live MT5 prices with modelled spread, slippage and commission. Its results are stored and shown separately from demo results.
-- **Desktop UI** built with PySide6 and custom-painted charts. Screens: dashboard, live signal monitor with a status timeline, positions, risk console with estimated consequences, Telegram sources, analytics and a searchable audit log.
+- **Deterministic signal parser.** Handles market, entry-zone, explicit `BUY/SELL LIMIT` & `STOP`, multi-TP (`TP1/TP2/TP3`, `TP open`), symbol aliases (`GOLD → XAUUSD`, `NAS → NAS100`, plus per-source custom aliases), and follow-up commands (*Move SL to BE*, *SL to 2655*, *New TP 2700*, *Close 50%*, *Close all*, *Cancel pending*, *TP1 hit*). Negations (*"don't close"*), everyday chat (*"close to TP1"*), European comma decimals (*"1,0850"*), and conditional instructions (*"close 50% if price hits 2670"*) are never executed blindly.
+- **Lot sizing from the broker's own specs.** Six sizing methods (*Fixed lot per TP*, *Fixed total lot*, *Fixed money at risk*, *% of equity*, *% of balance*, *Lot per balance step*). Loss at SL comes directly from `order_calc_profit()` so currency conversion, contract size and tick value always match the terminal. Volumes round **down** to the broker step; the signal's risk budget is split across all TP legs so 3 TPs never triple your risk.
+- **16-rule Risk Engine & pre-trade review.** Enforces per-signal risk, total open risk, correlated group exposure, per-symbol and per-order lot caps, daily-loss lockout, max-drawdown lockout, consecutive-loss circuit breaker, max concurrent trades, hourly frequency, margin usage, free margin, unit-free spread & entry-deviation filters, minimum R:R, UTC sessions, and symbol white/blacklists. Critical risk fields stay red until individually ticked (`✓`) — auto-execution is blocked until reviewed.
+- **Idempotent execution without duplicates.** Every order leg is committed to SQLite with a unique client tag (`TG<signal>L<leg>`) *before* `order_send`. On timeout, disconnect, or missing result, the leg becomes `UNCERTAIN`, waits a grace period, and reconciles against live positions, pending orders, and 7 days of deal history. A single retry is allowed only when proven absent and still within slippage; if the broker cannot be queried, the leg stays `UNCERTAIN` and is never retried.
+- **Double `AccountGuard` & 3-step `REAL ACCOUNT` opt-in.** Verifies account type, login and server on connect and again on *every* trade request. Real-money trading is off by default and requires: (1) enabling *Allow real-money accounts*, (2) switching to **REAL ACCOUNT** mode, and (3) typing the exact account number to confirm. Outside REAL ACCOUNT mode, only risk-reducing actions (closing or modifying SL/TP) are allowed; any unexpected real-account order engages a persistent emergency stop.
+- **Start-up recovery & trade management.** Reconciles uncertain/submitting orders, positions closed offline, expired waiting signals, and unmanaged orphan positions carrying our magic number. Supports automatic TP1 → Breakeven, trailing stops, hedging multi-leg splits, and netting `SINGLE_MANAGED` partial closes. Never replays historical Telegram messages (`catch_up=False`).
+- **Paper trading & full analytics.** Simulates fills on live MT5 quotes with configurable extra spread, slippage, and commission per lot. Paper results, equity curves, and CSV exports are strictly isolated from broker trades.
 
-| Live signal monitor | Risk management |
+---
+
+## Interface showcase
+
+All screenshots below are captured directly from the built-in **`--sandbox`** mode (simulated broker & Telegram feed, so all prices and P&L figures are synthetic).
+
+### Core trading workspace (Dark theme)
+
+| Live Signal Monitor (timeline & review queue) | Open Positions & Pending Orders |
 |---|---|
-| ![Signals](docs/screenshots/02-signals.png) | ![Risk](docs/screenshots/04-risk.png) |
-| **Positions** | **History & analytics** |
-| ![Positions](docs/screenshots/03-positions.png) | ![History](docs/screenshots/06-history.png) |
+| ![Signals](docs/screenshots/02-signals.png) | ![Positions](docs/screenshots/03-positions.png) |
+| **Risk Console & Live Account Sizing Preview** | **Trade History & Performance Analytics** |
+| ![Risk](docs/screenshots/04-risk.png) | ![History](docs/screenshots/06-history.png) |
 
-*The screenshots come from the built-in **sandbox mode** (simulated broker and Telegram feed), so the numbers are synthetic.*
+### Setup, diagnostics & audit trail
+
+| Telegram Sources & Per-Source Templates | Connection, Account Guard & Execution Modes |
+|---|---|
+| ![Sources](docs/screenshots/05-sources.png) | ![Connection](docs/screenshots/08-connection.png) |
+
+| Searchable Activity & Redacted Audit Log | Light Theme Support (Dashboard) |
+|---|---|
+| ![Log](docs/screenshots/07-log.png) | ![Light Dashboard](docs/screenshots/light/01-dashboard.png) |
+
+<details>
+<summary>More Light Theme screens (Signals, Positions, Risk, History)</summary>
+
+| Signals (Light) | Positions (Light) |
+|---|---|
+| ![Signals Light](docs/screenshots/light/02-signals.png) | ![Positions Light](docs/screenshots/light/03-positions.png) |
+| **Risk Console (Light)** | **History & Analytics (Light)** |
+| ![Risk Light](docs/screenshots/light/04-risk.png) | ![History Light](docs/screenshots/light/06-history.png) |
+
+</details>
+
+---
 
 ## Architecture
 
-```
- Telegram (Telethon, MTProto user session)
+```text
+ Telegram (Telethon, MTProto user session — catch_up=False)
         │  NEW / EDIT / DELETE events
         ▼
- bounded asyncio queue ──► MT5 worker thread (single, serial)
-                              │
-                              ├─ SignalParser        (pure, deterministic)
-                              ├─ ExecutionEngine     (state machine, idempotency, reconciliation)
-                              │     ├─ RiskEngine    (limits, lockouts; persisted)
-                              │     ├─ sizing        (order_calc_profit, volume step/min/max)
-                              │     └─ management    (BE, partials, trailing, follow-ups)
-                              ├─ AccountGuard ─────► MT5Gateway (MetaTrader5 | Paper | Fake)
-                              └─ SQLite (SQLAlchemy + Alembic) — audit trail of every decision
+ bounded asyncio.Queue (max 1000) ──► single dedicated `mt5` worker thread (serial)
+                                           │
+                                           ├─ SignalParser     (pure, deterministic, zero I/O)
+                                           ├─ ExecutionEngine  (state machine, idempotency, reconcile)
+                                           │     ├─ RiskEngine (16 checks, persisted lockouts)
+                                           │     ├─ sizing     (order_calc_profit, step/min/max)
+                                           │     └─ management (BE, partials, trailing, follow-ups)
+                                           ├─ AccountGuard ──► MT5Gateway (MetaTrader5 | Paper | Sim)
+                                           └─ SQLite (WAL, synchronous=FULL, Alembic migrations)
         ▲
- PySide6 UI (qasync) ── calls AppService only; it has no access to order sending
+ PySide6 UI (qasync) ── calls AppService only; has zero direct access to order sending
 ```
 
-All MetaTrader5 calls run on one worker thread, because the official package is not thread-safe. Running them serially also prevents races between signals that arrive at the same time. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the state machine, the database schema and design decisions.
+All `MetaTrader5` calls and pipeline state transitions execute serially on a single worker thread (the official MT5 package is not thread-safe, and serialization eliminates risk-check races between simultaneous signals). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full state machine, database schema, and design decisions.
+
+---
 
 ## Download (Windows)
 
-Get both files from the [latest release](https://github.com/iulian880/telegram-mt5-copier/releases/latest):
+Get both signed executables from the [latest GitHub Release](https://github.com/iulian880/tgmt5/releases/latest):
 
 | File | Use it when |
 |---|---|
-| `TGMT5-Setup-<version>.exe` | You want a normal install. The wizard lets you choose me only or all users, the install folder, the Start-menu folder (or none), a desktop shortcut, start with Windows, and more. |
-| `TGMT5-Portable-<version>.exe` | You want one self-contained file to copy and run, with no install. It keeps its data next to the `.exe`. |
+| `TGMT5-Setup-<version>.exe` | Standard Windows installer. Wizard lets you pick current user (no admin) or all users, install folder, Start-menu shortcuts, desktop/Sandbox shortcuts, and start with Windows. |
+| `TGMT5-Portable-<version>.exe` | Single self-contained executable — no installation, no admin rights. Stores its data in `TGMT5-data\` beside the `.exe`. |
 
-You also need the MetaTrader 5 terminal for real (demo) trading. `--sandbox` works without it. The files are signed with a self-signed test certificate, so Windows SmartScreen will warn you: click **More info → Run anyway**. Details are in [INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md). **Updating:** run the new Setup over the installed version; your settings, history and passwords are kept, and the database is backed up first.
+MetaTrader 5 is required for live/demo trading; `--sandbox` runs standalone without MT5 or Telegram. Releases are signed with a self-signed test certificate, so Windows SmartScreen will prompt: click **More info → Run anyway** (details in [docs/INSTALL_WINDOWS.md](docs/INSTALL_WINDOWS.md)). **Updating:** run the new Setup over your existing install — settings, history, and Credential Manager secrets are preserved, and the database is backed up automatically first.
+
+---
 
 ## Quick start (from source)
 
 ```powershell
-# Windows 11, Python 3.12 or newer, MetaTrader 5 terminal installed
-git clone https://github.com/iulian880/telegram-mt5-copier
-cd telegram-mt5-copier
-py -3 -m venv .venv; .\.venv\Scripts\Activate.ps1
+# Windows 10/11, Python 3.12+, MetaTrader 5 terminal installed
+git clone https://github.com/iulian880/tgmt5
+cd tgmt5
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m tgmt5             # real mode (starts in MONITOR ONLY)
-python -m tgmt5 --sandbox   # try everything with a simulated broker + Telegram feed (any OS)
+python -m tgmt5             # real mode (always starts in MONITOR ONLY)
+python -m tgmt5 --sandbox   # explore everything with a simulated broker + Telegram feed (any OS)
 ```
 
-Full guides:
-- [Windows installation, installer, portable build & code signing](docs/INSTALL_WINDOWS.md)
-- [Telegram API setup](docs/TELEGRAM_SETUP.md)
-- [IC Markets SC DEMO / MT5 setup](docs/MT5_DEMO_SETUP.md)
-- [User guide](docs/USER_GUIDE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Test report & known limitations](docs/TEST_REPORT.md)
+---
 
-## Tests
+## Verification & automated tests
 
 ```bash
-pytest -q                    # 257 tests, no credentials or broker needed
-pytest -m demo_e2e -s        # optional real DEMO round trip (Windows, explicit opt-in)
+QT_QPA_PLATFORM=offscreen pytest -q   # 299 passed, 0 warnings (no credentials or broker needed)
+pytest -m demo_e2e -s                 # optional real DEMO round trip (Windows + explicit opt-in)
 ```
 
-The suite covers parser formats and false positives, edits, duplicates, reply-based management, signal expiry, FX/XAU/JPY sizing, broker volume limits, risk caps, margin, lockouts, multi-TP allocation, broker rejections, timeouts with and without execution, disconnects, restarts and recovery, concurrent signals, partial closes, emergency stop, flatten-all, live-account blocking, secret redaction and a GUI smoke test.
+The test suite spans **16 test modules (299 tests)** running in CI across Ubuntu and Windows on Python 3.12–3.14, covering:
+
+- **Parser & safety regressions** (`test_parser.py`, `test_regressions_v040.py`, `test_regressions_v050.py`): all signal formats, aliases, false positives, chat-not-commands, comma decimals, conditional commands, zero-price guards, edits, and deletions.
+- **Position sizing & risk profiles** (`test_sizing.py`, `test_sizing_modes.py`, `test_risk_profiles.py`): FX/XAU/JPY sizing, floor-to-step rounding, multi-TP budget splits, small-account policies, pre-trade review stamping, and live/offline previews.
+- **Execution, management & recovery** (`test_engine.py`, `test_management.py`, `test_real_account.py`): idempotency, timeouts (both executed and absent), unreachable broker reconciliation, partial fills, BE/trailing/managed partials, netting protection, emergency stop, flatten-all, and 3-step `REAL ACCOUNT` blocking.
+- **Service, persistence, security & UI** (`test_service.py`, `test_telegram.py`, `test_config_compat.py`, `test_startup_shutdown.py`, `test_main.py`, `test_ui_smoke.py`): async worker-thread serialization, SQLite + Alembic migrations, secret redaction in logs/tracebacks/DB payloads, and offscreen rendering of all 8 UI pages.
+
+*Honest verification note:* Real `MetaTrader5` terminal IPC and live Telethon network sessions are Windows/live-only and are not exercised in headless macOS/Ubuntu test runs; Windows packaging and `--sandbox` startup are verified on every push by GitHub Actions (`windows-latest`). See [docs/TEST_REPORT.md](docs/TEST_REPORT.md) for the full breakdown and known limitations.
+
+---
+
+## Documentation
+
+- [Architecture & state machine](docs/ARCHITECTURE.md)
+- [Windows installation, installer, portable build & code signing](docs/INSTALL_WINDOWS.md)
+- [Telegram API setup](docs/TELEGRAM_SETUP.md)
+- [IC Markets SC DEMO & MT5 setup](docs/MT5_DEMO_SETUP.md)
+- [User guide (modes, sizing, profiles, small accounts)](docs/USER_GUIDE.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Test report & known limitations](docs/TEST_REPORT.md)
+- [Release notes (v0.5.0)](docs/release-notes/v0.5.0.md) · [v0.4.0](docs/release-notes/v0.4.0.md)
+
+---
 
 ## Tech stack
 
