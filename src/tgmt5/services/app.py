@@ -136,7 +136,7 @@ class AppService:
 
     def _maybe_telegram_notify(self, data: dict) -> None:
         n = self.config.notifications
-        ev = data.get("event")
+        ev = str(data.get("event") or "")
         wanted = {"executed": n.on_executed, "rejected": n.on_rejected, "closed": n.on_closed}
         if not n.telegram_destination or not wanted.get(ev, False) or self._loop is None:
             return
@@ -342,7 +342,10 @@ class AppService:
             self._fail_count = 0
             self.risk.mt5_unstable = False
             self.engine.set_mode(ExecutionMode.MONITOR, ReadOnlyGateway(guard))
-            self.engine.resolver.suffix = cfg.symbol_suffix
+            resolver = self.engine.resolver
+            if resolver is None:    # never leave the broker symbol suffix unapplied
+                raise GatewayError("symbol resolver missing after connecting")
+            resolver.suffix = cfg.symbol_suffix
             self.last_recovery = recover(self._recovery_engine(self._broker_mode(acct), guard))
             kind = "DEMO" if acct.is_demo else "REAL-MONEY"
             self.engine.audit_app("INFO" if acct.is_demo else "WARNING", "mt5",
@@ -660,7 +663,7 @@ class AppService:
                 SignalRow.kind == MessageKind.NEW_SIGNAL.value, SignalRow.stop_loss.is_not(None),
                 SignalRow.symbol.is_not(None)).order_by(SignalRow.id.desc()).limit(300))
             for r in rows:
-                if r.symbol in out:
+                if r.symbol is None or r.stop_loss is None or r.direction is None or r.symbol in out:
                     continue
                 entry = r.entry_price if r.entry_price is not None else (
                     (r.entry_low + r.entry_high) / 2 if r.entry_low and r.entry_high else None)
@@ -680,8 +683,9 @@ class AppService:
     def _snapshot(self) -> Snapshot:
         gw = self.engine.gw
         acct = gw.account_info() if gw else None
-        connected = bool(self.real_gw and self.real_gw.is_connected())
-        real_acct = (acct if gw is self.real_gw else self.real_gw.account_info()) if connected else None
+        real_gw = self.real_gw
+        connected = bool(real_gw and real_gw.is_connected())
+        real_acct = (acct if gw is real_gw else real_gw.account_info()) if connected and real_gw else None
         confirm_acct = real_acct or acct
         tg = self.telegram.status
         snap = Snapshot(
@@ -695,8 +699,8 @@ class AppService:
                                              else self.risk.state.confirmed_account)
                            == f"{confirm_acct.login}@{confirm_acct.server}"),
             queue_depth=self.queue.qsize(), real_account=real_acct)
-        if connected:
-            ti = self.real_gw.terminal_info()
+        if connected and real_gw is not None:
+            ti = real_gw.terminal_info()
             snap.algo_trading = bool(ti.trade_allowed) if ti else None
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         sim = self.engine.simulated

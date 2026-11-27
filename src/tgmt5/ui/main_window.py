@@ -24,7 +24,7 @@ from tgmt5.ui.widgets import Dot, NavButton, Pill, Toast, hbox, label, run_async
 
 class Bridge(QObject):
     """Thread-safe hop from the MT5 worker thread to the GUI thread."""
-    event = Signal(str, dict)
+    app_event = Signal(str, dict)   # not "event": that name would shadow QObject.event()
 
 
 NAV = [("Dashboard", DashboardPage), ("Signals", SignalsPage), ("Positions", PositionsPage),
@@ -134,8 +134,8 @@ class MainWindow(QMainWindow):
 
         # ---- events & refresh
         self.bridge = Bridge()
-        self.bridge.event.connect(self._on_event)
-        svc.subscribe(lambda k, d: self.bridge.event.emit(k, d) if k != "tick" else None)
+        self.bridge.app_event.connect(self._on_event)
+        svc.subscribe(lambda k, d: self.bridge.app_event.emit(k, d) if k != "tick" else None)
         self.tray = QSystemTrayIcon(self) if QSystemTrayIcon.isSystemTrayAvailable() else None
         if self.tray:
             self.tray.setIcon(icons.app_icon())
@@ -195,8 +195,9 @@ class MainWindow(QMainWindow):
         self.nav[2].set_badge(str(len(s.positions)) if s.positions else "", "accent")
         if self.tray:
             self.tray.setToolTip(f"TGMT5 · {s.mode}" + (f" · {len(s.positions)} position(s)" if s.positions else ""))
-        page = self.stack.currentWidget()
-        page.refresh(s)
+        refresh = getattr(self.stack.currentWidget(), "refresh", None)
+        if callable(refresh):
+            refresh(s)
 
     def _on_event(self, kind: str, data: dict) -> None:
         for p in self.pages:

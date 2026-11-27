@@ -158,8 +158,9 @@ class SignalsPage(Page):
                 rows = [r for r in rows if term in (r.symbol or "") or term in r.message.text.upper()]
             while self.list.count():
                 it = self.list.takeAt(0)
-                if it.widget():
-                    it.widget().deleteLater()
+                w = it.widget() if it is not None else None
+                if w is not None:
+                    w.deleteLater()
             for r in rows:
                 self.list.addWidget(SignalCard(r, self))
             if not rows:

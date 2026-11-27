@@ -18,6 +18,17 @@ from tgmt5.ui.widgets import Card, Dot, ResponsiveRow, Toast, hbox, label, run_a
 SRC_COLS = ["Enabled", "Chat ID", "Name", "Risk ×", "Symbol aliases (GOLD=XAUUSD, …)", "Parser template"]
 
 
+def _cell(table: QTableWidget, row: int, col: int) -> str:
+    """Text of a table cell; a cell without an item reads as ""."""
+    it = table.item(row, col)
+    return it.text() if it is not None else ""
+
+
+def _checked(table: QTableWidget, row: int, col: int) -> bool:
+    it = table.item(row, col)
+    return it is not None and it.checkState() == Qt.Checked
+
+
 class SourcesPage(Page):
     title = "Telegram Sources"
     subtitle = ("Log in with your own Telegram account (MTProto user session). Only groups/channels you "
@@ -165,11 +176,14 @@ class SourcesPage(Page):
         run_async(self.svc.telegram.list_dialogs(), show)
 
     def _add_selected(self) -> None:
-        existing = {int(self.src.item(r, 1).text()) for r in range(self.src.rowCount())}
+        existing = {int(t) for r in range(self.src.rowCount()) if (t := _cell(self.src, r, 1).strip())}
         for idx in self.dialogs.selectionModel().selectedRows():
-            cid = int(self.dialogs.item(idx.row(), 2).text())
+            cid_text = _cell(self.dialogs, idx.row(), 2).strip()
+            if not cid_text:
+                continue
+            cid = int(cid_text)
             if cid not in existing:
-                self._add_row(SourceConfig(chat_id=cid, title=self.dialogs.item(idx.row(), 0).text()))
+                self._add_row(SourceConfig(chat_id=cid, title=_cell(self.dialogs, idx.row(), 0)))
         Toast.show_message("Added - press 'Save sources' to apply", "info")
 
     def _add_row(self, s: SourceConfig) -> None:
@@ -197,17 +211,17 @@ class SourcesPage(Page):
             out = []
             for r in range(self.src.rowCount()):
                 aliases = {}
-                for part in self.src.item(r, 4).text().split(","):
+                for part in _cell(self.src, r, 4).split(","):
                     if "=" in part:
                         k, v = part.split("=", 1)
                         aliases[k.strip().upper()] = v.strip().upper()
-                tmpl = self.src.item(r, 5).text().strip() or "default"
+                tmpl = _cell(self.src, r, 5).strip() or "default"
                 if tmpl not in ("default", "implicit_market"):
                     raise ValueError(f"unknown parser template {tmpl!r}")
                 out.append(SourceConfig(
-                    chat_id=int(self.src.item(r, 1).text()), title=self.src.item(r, 2).text(),
-                    enabled=self.src.item(r, 0).checkState() == Qt.Checked,
-                    risk_multiplier=float(self.src.item(r, 3).text()), symbol_aliases=aliases,
+                    chat_id=int(_cell(self.src, r, 1)), title=_cell(self.src, r, 2),
+                    enabled=_checked(self.src, r, 0),
+                    risk_multiplier=float(_cell(self.src, r, 3)), symbol_aliases=aliases,
                     template=tmpl))
         except Exception as e:  # noqa: BLE001
             Toast.show_error(f"Invalid source settings: {e}")

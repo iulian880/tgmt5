@@ -160,7 +160,7 @@ The test suite spans **16 test modules (299 tests)** running in CI across Ubuntu
 - [User guide (modes, sizing, profiles, small accounts)](docs/USER_GUIDE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Test report & known limitations](docs/TEST_REPORT.md)
-- [Release notes (v0.5.0)](docs/release-notes/v0.5.0.md) · [v0.4.0](docs/release-notes/v0.4.0.md)
+- [Release notes (v0.5.1)](docs/release-notes/v0.5.1.md) · [v0.5.0](docs/release-notes/v0.5.0.md) · [v0.4.0](docs/release-notes/v0.4.0.md)
 
 ---
 

@@ -44,7 +44,7 @@ from tgmt5.mt5.interface import (
 )
 from tgmt5.mt5.symbols import SymbolResolver
 from tgmt5.parsing.parser import ParserConfig, SignalParser
-from tgmt5.persistence.db import Database
+from tgmt5.persistence.db import Database, must_get
 from tgmt5.persistence.models import ExecutionRow, SignalEventRow, SignalRow, TelegramMessageRow
 from tgmt5.risk.engine import OpenRisk, RiskEngine, TradeProposal, position_open_risk
 from tgmt5.risk.sizing import (
@@ -274,7 +274,7 @@ class ExecutionEngine:
         status = SignalStatus(sig.status)
         if status in REPROCESSABLE_ON_EDIT:
             with self.db.session() as s:
-                srow = s.get(SignalRow, sig.id)
+                srow = must_get(s, SignalRow, sig.id)
                 self._transition(s, srow, SignalStatus.RECEIVED, "message edited - re-evaluating")
             return self._interpret(row_id, msg, existing=sig)
         if status.is_active_trade and sig.kind == MessageKind.NEW_SIGNAL.value:
@@ -334,8 +334,7 @@ class ExecutionEngine:
     def process_signal(self, sig_id: int, message_date: datetime | None = None,
                        *, from_waiting: bool = False) -> SignalStatus:
         with self.db.session() as s:
-            sig = s.get(SignalRow, sig_id)
-            assert sig is not None
+            sig = must_get(s, SignalRow, sig_id)
             parsed = _row_to_signal(sig)
             d = Decision(approved=True)
             try:
@@ -593,7 +592,7 @@ class ExecutionEngine:
         assert self.gw is not None
         ex = self.cfg.execution
         with self.db.session() as s:
-            sig = s.get(SignalRow, sig_id)
+            sig = must_get(s, SignalRow, sig_id)
             self._transition(s, sig, SignalStatus.SUBMITTING,
                              f"sending {len(plan.legs)} order(s), total {plan.total_volume} lots")
             direction = sig.direction
@@ -644,7 +643,7 @@ class ExecutionEngine:
     def _send_leg(self, leg_id: int, plan: ExecutionPlan) -> None:
         assert self.gw is not None
         with self.db.session() as s:
-            leg = s.get(ExecutionRow, leg_id)
+            leg = must_get(s, ExecutionRow, leg_id)
             fillings = self._filling_modes(plan.spec, plan.pending)
             price = plan.price
             attempts = 0
@@ -731,9 +730,10 @@ class ExecutionEngine:
         if res.volume and res.volume + 1e-9 < leg.volume:
             leg.volume = res.volume     # partial fill: track what we really hold
             leg.broker_comment += " (partial fill)"
-        if leg.fill_price and leg.requested_price:
+        fill, requested = leg.fill_price, leg.requested_price
+        if fill and requested:
             leg.slippage_points = round(
-                (leg.fill_price - leg.requested_price) / plan.spec.point *
+                (fill - requested) / plan.spec.point *
                 (1 if leg.direction == "BUY" else -1), 1)
         try:
             pos = self._find_position_by_tag(leg.client_tag)
@@ -792,7 +792,7 @@ class ExecutionEngine:
 
     def _finalize_signal(self, sig_id: int, pending: bool) -> SignalStatus:
         with self.db.session() as s:
-            sig = s.get(SignalRow, sig_id)
+            sig = must_get(s, SignalRow, sig_id)
             states = [LegState(e.state) for e in sig.executions]
             ok = [st for st in states if st in (LegState.OPEN, LegState.PENDING, LegState.CLOSED)]
             if any(st is LegState.UNCERTAIN for st in states):
@@ -866,7 +866,7 @@ class ExecutionEngine:
                            msg: TelegramMessage) -> SignalStatus:
         from tgmt5.execution.management import resolve_target
         with self.db.session() as s:
-            row = s.get(SignalRow, sig_id)
+            row = must_get(s, SignalRow, sig_id)
             target, why = resolve_target(s, self, msg, instr)
             if target is None:
                 status = SignalStatus.MANUAL_REVIEW if why.startswith("ambiguous") else SignalStatus.REJECTED
@@ -885,7 +885,7 @@ class ExecutionEngine:
                 return SignalStatus.MONITORED
         ok, detail = self._apply_management(target, instr, origin=f"message {msg.message_id}")
         with self.db.session() as s:
-            row = s.get(SignalRow, sig_id)
+            row = must_get(s, SignalRow, sig_id)
             self._transition(s, row, SignalStatus.EXECUTED if ok else SignalStatus.FAILED,
                              f"{instr.type.value} on signal #{target}: {detail}")
         return SignalStatus.EXECUTED if ok else SignalStatus.FAILED
@@ -901,9 +901,10 @@ class ExecutionEngine:
         from tgmt5.execution.management import manage_open_trades
         if self.gw is None:
             return
-        if hasattr(self.gw, "refresh"):
+        refresh = getattr(self.gw, "refresh", None)
+        if callable(refresh):
             try:
-                self.gw.refresh()       # simulator: process SL/TP/pending triggers
+                refresh()               # simulator: process SL/TP/pending triggers
             except Exception:  # noqa: BLE001
                 log.exception("simulator refresh failed")
         self.refresh_account()
@@ -953,6 +954,8 @@ def _signal_dict(p: ParsedSignal) -> dict:
 
 
 def _row_to_signal(r: SignalRow) -> ParsedSignal:
+    if r.symbol is None or r.stop_loss is None or r.direction is None or r.entry_type is None:
+        raise ValueError(f"signal #{r.id} is missing its symbol, direction, entry type or stop loss")
     return ParsedSignal(direction=Direction(r.direction), symbol=r.symbol,
                         entry_type=EntryType(r.entry_type), stop_loss=r.stop_loss,
                         take_profits=tuple(r.take_profits or ()), entry_price=r.entry_price,

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
@@ -88,45 +89,59 @@ class TelethonSource:
                               request_retries=3, catch_up=False,
                               device_model="TGMT5 Desktop", app_version=__version__)
 
+    def _connected_client(self):
+        """The Telethon client built by connect(); raises instead of handing out None."""
+        if self.client is None:
+            raise LoginRequired("Telegram is not connected - log in from the Sources screen")
+        return self.client
+
     async def connect(self) -> bool:
         if self.client is None:
             self.client = self._build_client()
-        if not self.client.is_connected():
-            await self.client.connect()
-        self.status.connected = self.client.is_connected()
-        self.status.authorized = await self.client.is_user_authorized()
+        client = self.client
+        if not client.is_connected():
+            await client.connect()
+        self.status.connected = client.is_connected()
+        self.status.authorized = await client.is_user_authorized()
         if self.status.authorized:
-            me = await self.client.get_me()
-            self.status.user = (me.username or me.first_name or "") if me else ""
+            me = await client.get_me()
+            self.status.user = (getattr(me, "username", None) or getattr(me, "first_name", None)
+                                or "") if me else ""
         return self.status.authorized
 
     async def send_code(self, phone: str) -> None:
         await self.connect()
-        sent = await self.client.send_code_request(phone)
+        sent = await self._connected_client().send_code_request(phone)
         self._phone_code_hash = sent.phone_code_hash
 
     async def sign_in(self, phone: str, code: str, password: str | None = None) -> str:
         """Returns "ok" or "password_required" (2FA)."""
         from telethon.errors import SessionPasswordNeededError
         await self.connect()
+        client = self._connected_client()
+        if self._phone_code_hash is None:
+            raise LoginRequired("Request a login code first (Send code), then sign in")
         try:
-            await self.client.sign_in(phone=phone, code=code, phone_code_hash=self._phone_code_hash)
+            await client.sign_in(phone=phone, code=code, phone_code_hash=self._phone_code_hash)
         except SessionPasswordNeededError:
             if not password:
                 return "password_required"
-            await self.client.sign_in(password=password)
+            await client.sign_in(password=password)
         self._persist_session()
         self.status.authorized = True
         return "ok"
 
     async def sign_in_password(self, password: str) -> str:
-        await self.client.sign_in(password=password)
+        await self._connected_client().sign_in(password=password)
         self._persist_session()
         self.status.authorized = True
         return "ok"
 
     def _persist_session(self) -> None:
-        self.secrets.set(SecretStore.TG_SESSION, self.client.session.save())
+        session = self._connected_client().session
+        if session is None:
+            raise LoginRequired("Telegram session missing - log in again from the Sources screen")
+        self.secrets.set(SecretStore.TG_SESSION, session.save())
 
     async def logout(self) -> None:
         if self._watch_task:
@@ -145,7 +160,7 @@ class TelethonSource:
             raise LoginRequired("Telegram session not authorised - log in from the Sources screen")
         self._on_message = on_message
         self._chat_ids = set(chat_ids)
-        c = self.client
+        c = self._connected_client()
         # Remove any previous handlers so restarting the listener never duplicates messages.
         for fn in (self._on_new, self._on_edit, self._on_deleted):
             c.remove_event_handler(fn)
@@ -165,7 +180,9 @@ class TelethonSource:
             self._watch_task.cancel()
             self._watch_task = None
         if self.client:
-            await self.client.disconnect()
+            res = self.client.disconnect()
+            if inspect.isawaitable(res):    # Telethon returns a coroutine inside a running loop
+                await res
         self.status.connected = False
 
     def _convert(self, event, kind: MessageEventType) -> TelegramMessage | None:
@@ -217,18 +234,19 @@ class TelethonSource:
         was_connected = True
         while True:
             await asyncio.sleep(15)
-            connected = bool(self.client and self.client.is_connected())
+            client = self.client
+            connected = bool(client and client.is_connected())
             if connected and not was_connected:
                 self.status.reconnects += 1
                 log.warning("Telegram reconnected")
             if not connected and was_connected:
                 log.warning("Telegram disconnected - Telethon is reconnecting")
             was_connected = self.status.connected = connected
-            if connected:
+            if connected and client is not None:
                 try:
                     t0 = time.perf_counter()
                     await asyncio.wait_for(
-                        self.client(functions.PingRequest(ping_id=random.getrandbits(63))), 10)
+                        client(functions.PingRequest(ping_id=random.getrandbits(63))), 10)
                     self.status.latency_ms = (time.perf_counter() - t0) * 1000
                 except Exception as e:  # noqa: BLE001
                     log.warning("Telegram ping failed: %s", type(e).__name__)
@@ -238,7 +256,7 @@ class TelethonSource:
     async def list_dialogs(self) -> list[DialogInfo]:
         await self.connect()
         out = []
-        async for d in self.client.iter_dialogs():
+        async for d in self._connected_client().iter_dialogs():
             if d.is_group or d.is_channel:
                 out.append(DialogInfo(id=d.id, title=d.name or str(d.id),
                                       kind="channel" if d.is_channel and not d.is_group else "group"))
@@ -248,7 +266,7 @@ class TelethonSource:
         """Read past messages for parser evaluation / replay (never executed)."""
         await self.connect()
         out = []
-        async for m in self.client.iter_messages(chat_id, limit=limit):
+        async for m in self._connected_client().iter_messages(chat_id, limit=limit):
             date = m.date if m.date.tzinfo else m.date.replace(tzinfo=timezone.utc)
             out.append(TelegramMessage(source_id=chat_id, message_id=m.id, text=m.raw_text or "",
                                        date=date, reply_to_message_id=m.reply_to_msg_id))

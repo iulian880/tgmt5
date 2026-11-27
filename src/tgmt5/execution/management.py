@@ -22,6 +22,7 @@ from tgmt5.mt5.interface import (
     SYMBOL_FILLING_IOC, TRADE_ACTION_DEAL, TRADE_ACTION_MODIFY, TRADE_ACTION_REMOVE,
     TRADE_ACTION_SLTP, GatewayError, OrderType, Retcode, TradeRequest, TradeResult,
 )
+from tgmt5.persistence.db import must_get
 from tgmt5.persistence.models import ExecutionRow, SignalEventRow, SignalRow, TelegramMessageRow
 from tgmt5.risk.sizing import floor_to_step, step_decimals
 
@@ -94,8 +95,11 @@ def _fillings(spec) -> list[int]:
 
 
 def _send(eng: "ExecutionEngine", req: TradeRequest, what: str) -> TradeResult:
+    gw = eng.gw
     try:
-        res = eng.gw.send(req)
+        if gw is None:
+            raise GatewayError("MT5 not connected")
+        res = gw.send(req)
     except Exception as e:  # noqa: BLE001
         res = TradeResult(retcode=Retcode.CONNECTION, comment=f"exception: {e}")
     eng.audit_app("INFO" if res.ok else "WARNING", "mt5", f"{what}: {res.text}",
@@ -106,6 +110,8 @@ def _send(eng: "ExecutionEngine", req: TradeRequest, what: str) -> TradeResult:
 def close_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, volume: float,
               reason: str) -> tuple[bool, str]:
     gw = eng.gw
+    if gw is None:
+        return False, "MT5 not connected"
     spec = gw.symbol_spec(leg.symbol)
     tick = gw.tick(leg.symbol)
     if spec is None or tick is None or not leg.position_ticket:
@@ -159,6 +165,8 @@ def close_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, volume: flo
 def modify_leg_sl(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, new_sl: float | None,
                   reason: str, new_tp: float | None = None) -> tuple[bool, str]:
     gw = eng.gw
+    if gw is None:
+        return False, "MT5 not connected"
     spec = gw.symbol_spec(leg.symbol)
     tick = gw.tick(leg.symbol)
     if spec is None or tick is None:
@@ -169,9 +177,13 @@ def modify_leg_sl(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, new_sl:
     buy = leg.direction == "BUY"
     min_dist = spec.trade_stops_level * spec.point
     if leg.state == LegState.PENDING.value:
+        if not leg.order_ticket:
+            return False, "no order ticket"
         req = TradeRequest(action=TRADE_ACTION_MODIFY, symbol=leg.symbol, order=leg.order_ticket,
                            price=leg.requested_price or 0.0, sl=sl_val, tp=tp_val)
     else:
+        if not leg.position_ticket:
+            return False, "no position ticket"
         ref = tick.bid if buy else tick.ask
         if sl_val and ((buy and sl_val >= ref - min_dist) or (not buy and sl_val <= ref + min_dist)):
             return False, f"SL {sl_val} not valid vs current price {ref}"
@@ -192,6 +204,10 @@ def modify_leg_sl(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, new_sl:
 
 
 def cancel_pending_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, reason: str) -> tuple[bool, str]:
+    if eng.gw is None:
+        return False, "MT5 not connected"
+    if not leg.order_ticket:
+        return False, "no order ticket"
     res = _send(eng, TradeRequest(action=TRADE_ACTION_REMOVE, order=leg.order_ticket),
                 f"cancel {leg.client_tag} ({reason})")
     if res.ok or res.retcode == Retcode.INVALID_ORDER:
@@ -208,10 +224,11 @@ def cancel_pending_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow, re
 # ------------------------------------------------------------------ instructions
 def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementInstruction,
                       origin: str) -> tuple[bool, str]:
-    if eng.gw is None:
+    gw = eng.gw
+    if gw is None:
         return False, "MT5 not connected"
     with eng.db.session() as s:
-        sig = s.get(SignalRow, target_id)
+        sig = must_get(s, SignalRow, target_id)
         legs = list(sig.executions)
         open_legs = [l for l in legs if l.state == LegState.OPEN.value]
         pending = [l for l in legs if l.state == LegState.PENDING.value]
@@ -243,7 +260,9 @@ def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementI
             total_open = sum(l.volume - l.closed_volume for l in open_legs)
             if not open_legs:
                 return False, "no open position"
-            spec = eng.gw.symbol_spec(open_legs[0].symbol)
+            spec = gw.symbol_spec(open_legs[0].symbol)
+            if spec is None:
+                return False, f"no symbol spec for {open_legs[0].symbol}"
             target = floor_to_step(total_open * instr.fraction, spec.volume_step)
             if target < spec.volume_min - 1e-9:
                 return False, f"{instr.fraction:.0%} of {total_open} lots is below broker minimum"
@@ -263,8 +282,11 @@ def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementI
                 return False, "no open position"
             off = eng.cfg.execution.breakeven_offset_points
             for l in open_legs:
-                spec = eng.gw.symbol_spec(l.symbol)
+                spec = gw.symbol_spec(l.symbol)
                 entry = l.fill_price or l.requested_price
+                if spec is None or entry is None:
+                    results.append((False, f"{l.client_tag}: no price/spec"))
+                    continue
                 be = entry + (off * spec.point if l.direction == "BUY" else -off * spec.point)
                 ok, msg = modify_leg_sl(eng, s, l, be, origin)
                 if ok:
@@ -275,7 +297,7 @@ def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementI
             assert instr.price is not None
             d = 1 if sig.direction == "BUY" else -1
             ref_entry = sig.entry_price or sig.entry_low or sig.stop_loss
-            if instr.price <= 0 or abs(instr.price - ref_entry) / ref_entry > 0.2:
+            if instr.price <= 0 or not ref_entry or abs(instr.price - ref_entry) / ref_entry > 0.2:
                 return False, "new SL implausible"
             results = [modify_leg_sl(eng, s, l, instr.price, origin) for l in open_legs + pending]
             if any(ok for ok, _ in results):
@@ -306,6 +328,8 @@ def apply_instruction(eng: "ExecutionEngine", target_id: int, instr: ManagementI
 def sync_leg(eng: "ExecutionEngine", s: Session, leg: ExecutionRow,
              positions: dict | None = None, orders: dict | None = None) -> None:
     gw = eng.gw
+    if gw is None:
+        return
     if positions is None:
         positions = {p.ticket: p for p in gw.positions()}
     if orders is None:

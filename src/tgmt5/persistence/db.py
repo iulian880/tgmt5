@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar
 
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.engine import Engine
@@ -137,3 +137,14 @@ class Database:
             if search:
                 q = q.where(AppEventRow.message.ilike(f"%{search}%"))
             return list(s.scalars(q))
+
+
+RowT = TypeVar("RowT")
+
+
+def must_get(s: Session, model: type[RowT], ident: Any) -> RowT:
+    """Load a row the pipeline already knows exists; fail loudly instead of passing None on."""
+    row = s.get(model, ident)
+    if row is None:
+        raise LookupError(f"{model.__name__} #{ident} not found")
+    return row
